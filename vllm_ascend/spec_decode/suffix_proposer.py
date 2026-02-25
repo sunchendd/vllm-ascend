@@ -25,7 +25,7 @@ from vllm.distributed import get_tensor_model_parallel_rank
 # VLLM_ASCEND_CALIBRATE_MAX_CONCURRENCY: 校准时的最大测试并发数 (默认64)
 
 ADAPTIVE_SPEC_ENABLED = os.environ.get("VLLM_ASCEND_ADAPTIVE_SPEC", "0") == "1"
-ADAPTIVE_LOG_INTERVAL = float(os.environ.get("VLLM_ASCEND_ADAPTIVE_LOG_INTERVAL", "30"))
+ADAPTIVE_LOG_INTERVAL = float(os.environ.get("VLLM_ASCEND_ADAPTIVE_LOG_INTERVAL", "60"))
 
 # 阈值配置
 # -1: 等待校准
@@ -247,25 +247,28 @@ class SuffixDecodingProposer(VllmSuffixDecodingProposer, Proposer):
         SuffixDecodingProposer._force_skip_speculation = True
 
     def _should_skip_speculation(self, num_reqs: int) -> bool:
-        """Core logic for Adaptive Speculation"""
-        # 1. Calibration Mode: controlled by Calibrator strictly
+        """Core logic for Adaptive Speculation - optimized for performance."""
+        # Fast path 1: Calibration Mode (controlled by Calibrator strictly)
         if SuffixDecodingProposer._calibration_mode:
             return SuffixDecodingProposer._force_skip_speculation
-            
-        # 2. Global Force Skip (safety switch)
+
+        # Fast path 2: Global Force Skip (safety switch)
         if SuffixDecodingProposer._force_skip_speculation:
             return True
-            
-        # 3. If Adaptive Disabled -> Always Speculate (unless configured otherwise in upper layers)
+
+        # Fast path 3: If Adaptive Disabled -> Always Speculate
         if not self._adaptive_enabled:
             return False
-            
-        # 4. If waiting for calibration (-1) -> Default to Speculate (allow warmup)
-        if self._adaptive_threshold == -1:
+
+        # Fast path 4: Get threshold without lock (safe for reads)
+        threshold = self._adaptive_threshold
+
+        # If waiting for calibration (-1) -> Default to Speculate (allow warmup)
+        if threshold == -1:
             return False
-            
-        # 5. Threshold Logic
-        return num_reqs > self._adaptive_threshold
+
+        # Threshold Logic
+        return num_reqs > threshold
 
     # --- Calibration ---
 
@@ -352,12 +355,14 @@ class SuffixDecodingProposer(VllmSuffixDecodingProposer, Proposer):
                 logger.info("[AdaptiveSpec] Triggering initial calibration...")
                 self._run_calibration_async()
                 
-        # --- Update Local Threshold from Global ---
-        with SuffixDecodingProposer._calibration_lock:
-             if SuffixDecodingProposer._calibrated_threshold is not None:
-                 if self._adaptive_threshold != SuffixDecodingProposer._calibrated_threshold:
-                     self._adaptive_threshold = SuffixDecodingProposer._calibrated_threshold
-                     logger.info(f"[AdaptiveSpec] Local threshold updated to {self._adaptive_threshold}")
+        # --- Update Local Threshold from Global (optimized) ---
+        if SuffixDecodingProposer._calibrated_threshold != self._adaptive_threshold:
+            with SuffixDecodingProposer._calibration_lock:
+                if SuffixDecodingProposer._calibrated_threshold is not None:
+                    new_threshold = SuffixDecodingProposer._calibrated_threshold
+                    if self._adaptive_threshold != new_threshold:
+                        self._adaptive_threshold = new_threshold
+                        logger.info(f"[AdaptiveSpec] Local threshold updated to {self._adaptive_threshold}")
 
         # --- Runtime Logic ---
         input_batch = self.runner.input_batch
@@ -365,18 +370,19 @@ class SuffixDecodingProposer(VllmSuffixDecodingProposer, Proposer):
         
         skip = self._should_skip_speculation(num_reqs)
         
-        # Logging
-        if skip:
-            self._spec_disabled_count += 1
-        else:
-            self._spec_enabled_count += 1
-            
+        # Lightweight logging (less overhead)
         cur_time = time.time()
         if cur_time - self._last_log_time > self._log_interval:
             self._last_log_time = cur_time
             total = self._spec_disabled_count + self._spec_enabled_count
             ratio = (self._spec_enabled_count / total * 100) if total > 0 else 0
-            logger.info(f"[AdaptiveSpec] Status: P={num_reqs}, Th={self._adaptive_threshold}, Skip={skip}, SpecRate={ratio:.1f}%")
+            logger.info(f"[AdaptiveSpec] P={num_reqs}, Th={self._adaptive_threshold}, Skip={skip}, SpecRate={ratio:.1f}%")
+
+        # Update counters after logging check to reduce contention
+        if skip:
+            self._spec_disabled_count += 1
+        else:
+            self._spec_enabled_count += 1
 
         if skip:
             # Return empty lists to signal "no speculation"

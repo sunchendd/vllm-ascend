@@ -324,16 +324,37 @@ class SmartWarmupCalibrator:
                 
             # 如果倍增跑完了都没发现 Direct 赢，再测一下 Max Concurrency
             if not found_crossover_interval:
+                # 确保 max_concurrency 被测试
                 if self.max_concurrency not in comparisons:
                     r_max = self._compare(self.max_concurrency)
                     comparisons[self.max_concurrency] = r_max
-                    if r_max.winner == "direct":
-                        interval_start = curr
-                        interval_end = self.max_concurrency
-                        found_crossover_interval = True
-                    elif r_max.winner == "spec":
-                         # Max 也是 Spec 赢 -> 全程 Spec
-                        return WarmupCalibrationResult(999999, comparisons, 1.0, "Spec mode preferred up to max concurrency")
+                else:
+                    # 已经在倍增阶段测试过了，直接使用结果
+                    r_max = comparisons[self.max_concurrency]
+                    logger.info(
+                        "[Calibrator] Max concurrency P=%s already tested in doubling phase",
+                        self.max_concurrency,
+                    )
+
+                if r_max.winner == "direct":
+                    interval_start = curr
+                    interval_end = self.max_concurrency
+                    found_crossover_interval = True
+                elif r_max.winner in ["spec", "tie"]:
+                    # Max 也是 Spec 赢/平局 -> 全程 Spec
+                    logger.info(
+                        "[Calibrator] Max concurrency P=%s still prefers Spec. No threshold needed.",
+                        self.max_concurrency,
+                    )
+                    return WarmupCalibrationResult(
+                        optimal_threshold=999999,
+                        comparisons=comparisons,
+                        confidence=1.0,
+                        message=(
+                            "Spec mode preferred up to max concurrency "
+                            f"{self.max_concurrency}"
+                        ),
+                    )
             
             # 二分搜索精确点
             # 在 [interval_start, interval_end] 之间找 Spec 最后一次赢/平的点

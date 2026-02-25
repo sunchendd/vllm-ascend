@@ -20,5 +20,6 @@ large_scale_ep
 ucm_deployment
 Fine_grained_TP
 speculative_decoding
+adaptive_speculative_decoding
 context_parallel
 :::

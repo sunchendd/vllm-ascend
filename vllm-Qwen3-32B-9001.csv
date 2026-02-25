@@ -1,0 +1,4 @@
+Process Num,Input Length,Output Length,TTFT (ms),avg TPS (without prefill),avg TPS (with prefill),Total Time (ms),TPS (without prefill),TPS (with prefill),Error,avg input Tokens,avg output Tokens
+1,128,128,118.3779,25.868,25.456,5028.290748596191,25.868,25.456,,128,128
+1,256,256,138.5667,29.6804,29.3225,8730.501651763916,29.6804,29.3225,,256,256
+1,512,512,178.1633,27.7627,27.5499,18584.489822387695,27.7627,27.5499,,512,512
