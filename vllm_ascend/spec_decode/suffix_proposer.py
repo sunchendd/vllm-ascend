@@ -31,6 +31,7 @@ ADAPTIVE_LOG_INTERVAL = float(os.environ.get("VLLM_ASCEND_ADAPTIVE_LOG_INTERVAL"
 # -1: 等待校准
 # >=0: 具体阈值
 _threshold_str = os.environ.get("VLLM_ASCEND_ADAPTIVE_THRESHOLD", "")
+MANUAL_THRESHOLD_OVERRIDE = bool(_threshold_str)
 if _threshold_str:
     ADAPTIVE_THRESHOLD = int(_threshold_str)
     AUTO_CALIBRATE_ENABLED = False
@@ -251,6 +252,7 @@ class SuffixDecodingProposer(VllmSuffixDecodingProposer, Proposer):
         
         self._adaptive_enabled = ADAPTIVE_SPEC_ENABLED
         self._adaptive_threshold = ADAPTIVE_THRESHOLD
+        self._manual_threshold_override = MANUAL_THRESHOLD_OVERRIDE
         self._last_log_time = 0.0
         self._log_interval = ADAPTIVE_LOG_INTERVAL
         
@@ -452,24 +454,27 @@ class SuffixDecodingProposer(VllmSuffixDecodingProposer, Proposer):
                 self._run_calibration_async()
                 
         # --- Update Local Threshold from Global (optimized) ---
-        if SuffixDecodingProposer._calibrated_threshold != self._adaptive_threshold:
-            with SuffixDecodingProposer._calibration_lock:
-                if SuffixDecodingProposer._calibrated_threshold is not None:
-                    new_threshold = SuffixDecodingProposer._calibrated_threshold
-                    if self._adaptive_threshold != new_threshold:
-                        self._adaptive_threshold = new_threshold
-                        logger.info(f"[AdaptiveSpec] Local threshold updated to {self._adaptive_threshold}")
+        # Manual threshold has highest priority and should not be overridden
+        # by calibration state or shared threshold file.
+        if not self._manual_threshold_override:
+            if SuffixDecodingProposer._calibrated_threshold != self._adaptive_threshold:
+                with SuffixDecodingProposer._calibration_lock:
+                    if SuffixDecodingProposer._calibrated_threshold is not None:
+                        new_threshold = SuffixDecodingProposer._calibrated_threshold
+                        if self._adaptive_threshold != new_threshold:
+                            self._adaptive_threshold = new_threshold
+                            logger.info(f"[AdaptiveSpec] Local threshold updated to {self._adaptive_threshold}")
 
-        shared_threshold = SuffixDecodingProposer._read_shared_threshold()
-        if shared_threshold is not None:
-            shared_threshold = self._normalize_threshold(
-                shared_threshold,
-                self._calibrate_max_concurrency,
-            )
-            if self._adaptive_threshold != shared_threshold:
-                self._adaptive_threshold = shared_threshold
-                logger.info(
-                    f"[AdaptiveSpec] Synced threshold from shared file: {self._adaptive_threshold}")
+            shared_threshold = SuffixDecodingProposer._read_shared_threshold()
+            if shared_threshold is not None:
+                shared_threshold = self._normalize_threshold(
+                    shared_threshold,
+                    self._calibrate_max_concurrency,
+                )
+                if self._adaptive_threshold != shared_threshold:
+                    self._adaptive_threshold = shared_threshold
+                    logger.info(
+                        f"[AdaptiveSpec] Synced threshold from shared file: {self._adaptive_threshold}")
 
         # --- Runtime Logic ---
         input_batch = self.runner.input_batch
