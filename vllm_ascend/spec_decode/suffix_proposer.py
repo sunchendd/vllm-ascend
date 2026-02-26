@@ -50,6 +50,18 @@ CALIBRATE_CACHE_DIR = os.environ.get(
     os.path.expanduser("~/.cache/vllm_ascend/calibration")
 )
 CALIBRATE_CACHE_ENABLED = os.environ.get("VLLM_ASCEND_CALIBRATE_CACHE_ENABLED", "1") == "1"
+CALIBRATE_MODE_FILE = os.environ.get(
+    "VLLM_ASCEND_CALIBRATE_MODE_FILE",
+    "/tmp/vllm_ascend_calibrate_mode.flag",
+)
+CALIBRATE_MODE_POLL_INTERVAL = float(
+    os.environ.get("VLLM_ASCEND_CALIBRATE_MODE_POLL_INTERVAL", "0.2"))
+CALIBRATE_THRESHOLD_FILE = os.environ.get(
+    "VLLM_ASCEND_CALIBRATE_THRESHOLD_FILE",
+    "/tmp/vllm_ascend_calibrated_threshold.flag",
+)
+CALIBRATE_THRESHOLD_POLL_INTERVAL = float(
+    os.environ.get("VLLM_ASCEND_CALIBRATE_THRESHOLD_POLL_INTERVAL", "0.5"))
 
 
 def _parse_port_from_cmdline() -> Optional[int]:
@@ -164,6 +176,72 @@ class SuffixDecodingProposer(VllmSuffixDecodingProposer, Proposer):
     _force_skip_speculation = False
     
     _calibration_cache: Optional[CalibrationCache] = None
+    _shared_mode_file = Path(CALIBRATE_MODE_FILE)
+    _shared_mode_last_check = 0.0
+    _shared_mode_cached = "idle"
+    _shared_threshold_file = Path(CALIBRATE_THRESHOLD_FILE)
+    _shared_threshold_last_check = 0.0
+    _shared_threshold_cached: Optional[int] = None
+
+    @classmethod
+    def _write_shared_mode(cls, mode: str) -> None:
+        try:
+            cls._shared_mode_file.parent.mkdir(parents=True, exist_ok=True)
+            cls._shared_mode_file.write_text(mode)
+            cls._shared_mode_cached = mode
+            cls._shared_mode_last_check = time.time()
+        except Exception:
+            pass
+
+    @classmethod
+    def _read_shared_mode(cls) -> str:
+        now = time.time()
+        if now - cls._shared_mode_last_check < CALIBRATE_MODE_POLL_INTERVAL:
+            return cls._shared_mode_cached
+        cls._shared_mode_last_check = now
+        try:
+            if cls._shared_mode_file.exists():
+                mode = cls._shared_mode_file.read_text().strip() or "idle"
+                if mode in ("spec", "direct", "idle"):
+                    cls._shared_mode_cached = mode
+                    return mode
+        except Exception:
+            pass
+        cls._shared_mode_cached = "idle"
+        return "idle"
+
+    @classmethod
+    def _write_shared_threshold(cls, threshold: int) -> None:
+        try:
+            cls._shared_threshold_file.parent.mkdir(parents=True, exist_ok=True)
+            cls._shared_threshold_file.write_text(str(threshold))
+            cls._shared_threshold_cached = threshold
+            cls._shared_threshold_last_check = time.time()
+        except Exception:
+            pass
+
+    @classmethod
+    def _read_shared_threshold(cls) -> Optional[int]:
+        now = time.time()
+        if now - cls._shared_threshold_last_check < CALIBRATE_THRESHOLD_POLL_INTERVAL:
+            return cls._shared_threshold_cached
+        cls._shared_threshold_last_check = now
+        try:
+            if cls._shared_threshold_file.exists():
+                th = int(cls._shared_threshold_file.read_text().strip())
+                cls._shared_threshold_cached = th
+                return th
+        except Exception:
+            pass
+        return cls._shared_threshold_cached
+
+    @staticmethod
+    def _normalize_threshold(threshold: int, max_concurrency: int) -> int:
+        if threshold < 0:
+            return threshold
+        if max_concurrency > 0 and threshold > max_concurrency:
+            return max_concurrency
+        return threshold
 
     def __init__(self, vllm_config, device, runner):
         super().__init__(vllm_config)
@@ -198,10 +276,14 @@ class SuffixDecodingProposer(VllmSuffixDecodingProposer, Proposer):
             )
             
             if cached and 'threshold' in cached:
-                th = cached['threshold']
+                th = self._normalize_threshold(
+                    int(cached['threshold']),
+                    self._calibrate_max_concurrency,
+                )
                 with SuffixDecodingProposer._calibration_lock:
                     SuffixDecodingProposer._calibrated_threshold = th
                     SuffixDecodingProposer._calibration_done = True
+                    SuffixDecodingProposer._write_shared_threshold(th)
                 self._adaptive_threshold = th
                 logger.info(f"[AdaptiveSpec] Loaded cached threshold: {th}")
             else:
@@ -242,12 +324,20 @@ class SuffixDecodingProposer(VllmSuffixDecodingProposer, Proposer):
 
     def enable_speculation(self):
         SuffixDecodingProposer._force_skip_speculation = False
+        SuffixDecodingProposer._write_shared_mode("spec")
         
     def disable_speculation(self):
         SuffixDecodingProposer._force_skip_speculation = True
+        SuffixDecodingProposer._write_shared_mode("direct")
 
     def _should_skip_speculation(self, num_reqs: int) -> bool:
         """Core logic for Adaptive Speculation - optimized for performance."""
+        shared_mode = SuffixDecodingProposer._read_shared_mode()
+        if shared_mode == "direct":
+            return True
+        if shared_mode == "spec":
+            return False
+
         # Fast path 1: Calibration Mode (controlled by Calibrator strictly)
         if SuffixDecodingProposer._calibration_mode:
             return SuffixDecodingProposer._force_skip_speculation
@@ -282,6 +372,7 @@ class SuffixDecodingProposer(VllmSuffixDecodingProposer, Proposer):
                 
                 # Enter exclusive mode
                 SuffixDecodingProposer._calibration_mode = True
+                SuffixDecodingProposer._write_shared_mode("spec")
                 
                 calibrator = SmartWarmupCalibrator(
                     base_url=f"http://127.0.0.1:{self._calibrate_port}",
@@ -295,7 +386,10 @@ class SuffixDecodingProposer(VllmSuffixDecodingProposer, Proposer):
                 
                 threshold = -1
                 if result:
-                    threshold = result.optimal_threshold
+                    threshold = self._normalize_threshold(
+                        result.optimal_threshold,
+                        self._calibrate_max_concurrency,
+                    )
                     logger.info(f"[AdaptiveSpec] Calibration Success! Optimal threshold: {threshold}")
                     
                     # Update cache
@@ -306,12 +400,13 @@ class SuffixDecodingProposer(VllmSuffixDecodingProposer, Proposer):
                     )
                 else:
                     logger.error("[AdaptiveSpec] Calibration Failed. Defaulting to keep Speculation ON.")
-                    threshold = 9999 # Safe fallback
+                    threshold = self._calibrate_max_concurrency # Safe conservative fallback
                 
                 # Update Global State
                 with SuffixDecodingProposer._calibration_lock:
                     SuffixDecodingProposer._calibrated_threshold = threshold
                     SuffixDecodingProposer._calibration_done = True
+                    SuffixDecodingProposer._write_shared_threshold(threshold)
                     # Also update ENV for other processes if needed
                     os.environ["VLLM_ASCEND_ADAPTIVE_THRESHOLD"] = str(threshold)
 
@@ -323,6 +418,7 @@ class SuffixDecodingProposer(VllmSuffixDecodingProposer, Proposer):
                 SuffixDecodingProposer._calibration_mode = False
                 SuffixDecodingProposer._force_skip_speculation = False # Reset
                 SuffixDecodingProposer._calibration_in_progress = False
+                SuffixDecodingProposer._write_shared_mode("idle")
 
         t = threading.Thread(target=_job, daemon=True)
         t.start()
@@ -363,6 +459,17 @@ class SuffixDecodingProposer(VllmSuffixDecodingProposer, Proposer):
                     if self._adaptive_threshold != new_threshold:
                         self._adaptive_threshold = new_threshold
                         logger.info(f"[AdaptiveSpec] Local threshold updated to {self._adaptive_threshold}")
+
+        shared_threshold = SuffixDecodingProposer._read_shared_threshold()
+        if shared_threshold is not None:
+            shared_threshold = self._normalize_threshold(
+                shared_threshold,
+                self._calibrate_max_concurrency,
+            )
+            if self._adaptive_threshold != shared_threshold:
+                self._adaptive_threshold = shared_threshold
+                logger.info(
+                    f"[AdaptiveSpec] Synced threshold from shared file: {self._adaptive_threshold}")
 
         # --- Runtime Logic ---
         input_batch = self.runner.input_batch

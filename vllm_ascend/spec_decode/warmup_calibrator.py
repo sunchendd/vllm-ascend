@@ -10,15 +10,13 @@ import time
 import statistics
 import traceback
 import requests
+from requests.adapters import HTTPAdapter
 from typing import Optional, Tuple, Dict, List, Callable, Union
 from dataclasses import dataclass, field
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Event, Lock
 
 from vllm.logger import logger
-
-# 复用Session以提高HTTP请求性能
-RequestsSession = requests.Session()
 
 @dataclass
 class CalibrationMetric:
@@ -63,8 +61,8 @@ class SmartWarmupCalibrator:
         base_url: str = "http://127.0.0.1:8000",
         model_name: str = "default",
         max_concurrency: int = 64,
-        input_length: int = 256,
-        output_length: int = 128,
+        input_length: int = 1024,
+        output_length: int = 1024,
         timeout: float = 300.0,
         # 统计配置
         min_samples: int = 5,
@@ -85,6 +83,18 @@ class SmartWarmupCalibrator:
         self.cv_threshold = cv_threshold
         self.duration_per_test = duration_per_test
         self.winner_margin = winner_margin
+
+        # 独立会话 + 按并发扩容连接池，避免高并发校准时 connection pool 丢连接
+        self._session = requests.Session()
+        pool_size = max(16, self.max_concurrency * 2)
+        adapter = HTTPAdapter(
+            pool_connections=pool_size,
+            pool_maxsize=pool_size,
+            max_retries=0,
+            pool_block=True,
+        )
+        self._session.mount("http://", adapter)
+        self._session.mount("https://", adapter)
         
         # 回调函数
         self._enable_spec_callback: Optional[Callable] = None
@@ -120,7 +130,7 @@ class SmartWarmupCalibrator:
         
         try:
             start = time.perf_counter()
-            resp = RequestsSession.post(url, json=payload, timeout=self.timeout)
+            resp = self._session.post(url, json=payload, timeout=self.timeout)
             latency = (time.perf_counter() - start) * 1000 # ms
             
             if resp.status_code == 200:
@@ -270,6 +280,20 @@ class SmartWarmupCalibrator:
                    
         return ComparisonResult(concurrency, m_spec, m_direct, winner, improvement)
 
+    def _is_reliable_spec_win(self, result: ComparisonResult) -> bool:
+        """判断 Spec 获胜是否可靠，避免 tie/噪声导致阈值过大。"""
+        if result.winner != "spec":
+            return False
+
+        # 至少要明显胜过 margin，同时两侧误码率处于可接受范围
+        if result.improvement <= self.winner_margin:
+            return False
+
+        if result.spec_metric.error_rate > 0.05 or result.direct_metric.error_rate > 0.05:
+            return False
+
+        return True
+
     def run_calibration(self) -> Optional[WarmupCalibrationResult]:
         """运行完整校准流程"""
         if not self._wait_for_service():
@@ -340,19 +364,39 @@ class SmartWarmupCalibrator:
                     interval_start = curr
                     interval_end = self.max_concurrency
                     found_crossover_interval = True
-                elif r_max.winner in ["spec", "tie"]:
-                    # Max 也是 Spec 赢/平局 -> 全程 Spec
+                elif self._is_reliable_spec_win(r_max):
+                    # Max 明确且可靠地由 Spec 获胜 -> 阈值取 max_concurrency
                     logger.info(
-                        "[Calibrator] Max concurrency P=%s still prefers Spec. No threshold needed.",
+                        "[Calibrator] Max concurrency P=%s still prefers Spec. "
+                        "Use conservative threshold=max_concurrency.",
                         self.max_concurrency,
                     )
                     return WarmupCalibrationResult(
-                        optimal_threshold=999999,
+                        optimal_threshold=self.max_concurrency,
                         comparisons=comparisons,
                         confidence=1.0,
                         message=(
-                            "Spec mode preferred up to max concurrency "
+                            "Conservative strategy: Spec preferred within tested range up to "
                             f"{self.max_concurrency}"
+                        ),
+                    )
+                else:
+                    # tie 或不可靠胜出：保守地使用最后一个已确认非 direct 的并发
+                    logger.info(
+                        "[Calibrator] Max concurrency P=%s is not a reliable Spec win "
+                        "(winner=%s, diff=%+.1f%%). Use conservative threshold=%s.",
+                        self.max_concurrency,
+                        r_max.winner,
+                        r_max.improvement * 100,
+                        curr,
+                    )
+                    return WarmupCalibrationResult(
+                        optimal_threshold=curr,
+                        comparisons=comparisons,
+                        confidence=0.8,
+                        message=(
+                            "Conservative strategy: max concurrency result is tie or "
+                            "low-confidence Spec win"
                         ),
                     )
             
@@ -372,7 +416,7 @@ class SmartWarmupCalibrator:
                     res = self._compare(mid)
                     comparisons[mid] = res
                 
-                if res.winner in ["spec", "tie"]:
+                if res.winner == "spec":
                     best_threshold = mid
                     low = mid + 1
                 else:
@@ -402,7 +446,7 @@ class SmartWarmupCalibrator:
         start = time.time()
         while time.time() - start < 120:
             try:
-                if requests.get(f"{self.base_url}/health", timeout=1).status_code == 200:
+                if self._session.get(f"{self.base_url}/health", timeout=1).status_code == 200:
                     return True
             except:
                 pass
