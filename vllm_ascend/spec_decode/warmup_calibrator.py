@@ -79,11 +79,29 @@ class SmartWarmupCalibrator:
         self.output_length = output_length
         self.timeout = timeout
         
-        self.min_samples = min_samples
-        self.max_samples = max_samples
+        self.min_samples = max(1, min_samples)
+        self.max_samples = max(self.min_samples, max_samples)
         self.cv_threshold = cv_threshold
         self.duration_per_test = duration_per_test
         self.winner_margin = winner_margin
+        self.max_duration_per_test = max(
+            self.duration_per_test,
+            float(os.environ.get(
+                "VLLM_ASCEND_CALIBRATE_MAX_DURATION_PER_TEST",
+                str(self.duration_per_test * 6),
+            )),
+        )
+
+        # 校准请求参数（可通过环境变量覆盖）
+        self.request_temperature = float(
+            os.environ.get("VLLM_ASCEND_CALIBRATE_TEMPERATURE", "0.6")
+        )
+        self.request_top_p = float(
+            os.environ.get("VLLM_ASCEND_CALIBRATE_TOP_P", "0.95")
+        )
+        self.request_ignore_eos = (
+            os.environ.get("VLLM_ASCEND_CALIBRATE_IGNORE_EOS", "1") == "1"
+        )
 
         # 独立会话 + 按并发扩容连接池，避免高并发校准时 connection pool 丢连接
         self._session = requests.Session()
@@ -116,20 +134,18 @@ class SmartWarmupCalibrator:
         以确保每个请求前缀不同；同时保持总长度不变。
         """
         base = "人工智能技术的飞速发展正在深刻改变人类社会的方方面面，从自动驾驶到智能医疗，深度学习算法的应用无处不在。"
-        prompt = base
+
+        # 关键：nonce 放在开头，打散 prefix cache 的前缀命中。
+        if nonce:
+            prompt = f"[nonce:{nonce}] " + base
+        else:
+            prompt = base
+
         # 填充到目标长度
         while len(prompt) < self.input_length * 2:
             prompt += base
-        prompt = prompt[:self.input_length]
 
-        if nonce:
-            # 用 nonce 替换尾部，保证长度不变并尽量不影响主语义
-            nonce_text = f" [nonce:{nonce}]"
-            if len(nonce_text) >= len(prompt):
-                return nonce_text[-len(prompt):]
-            return prompt[:-len(nonce_text)] + nonce_text
-
-        return prompt
+        return prompt[:self.input_length]
 
     def _generate_unique_prompt(self) -> str:
         """生成去缓存化 prompt，避免校准时命中 prefix cache。"""
@@ -142,8 +158,9 @@ class SmartWarmupCalibrator:
             "model": self.model_name,
             "messages": [{"role": "user", "content": prompt}],
             "max_tokens": self.output_length,
-            "temperature": 0.0, # 确定性
-            "ignore_eos": True,
+            "temperature": self.request_temperature,
+            "top_p": self.request_top_p,
+            "ignore_eos": self.request_ignore_eos,
         }
         
         try:
@@ -214,6 +231,8 @@ class SmartWarmupCalibrator:
         samples_lat = []
         errors = 0
         total_reqs = 0
+        total_tokens = 0
+        total_batch_duration = 0.0
         
         # 预热当前并发级别 (1 round)
         with ThreadPoolExecutor(max_workers=concurrency) as executor:
@@ -252,10 +271,17 @@ class SmartWarmupCalibrator:
                 # 本轮 TPS
                 current_tps = batch_tokens / batch_duration
                 samples_tps.append(current_tps)
+                total_tokens += batch_tokens
+                total_batch_duration += batch_duration
             
             # 检查退出条件
             elapsed = time.perf_counter() - start_measure_time
-            if elapsed >= self.duration_per_test and len(samples_tps) >= self.min_samples:
+            sample_count = len(samples_tps)
+
+            if sample_count >= self.max_samples:
+                break
+
+            if elapsed >= self.duration_per_test and sample_count >= self.min_samples:
                 # 计算CV
                 mean = statistics.mean(samples_tps)
                 if mean > 0:
@@ -263,14 +289,26 @@ class SmartWarmupCalibrator:
                     if cv <= self.cv_threshold:
                         break
             
-            if elapsed > self.duration_per_test * 2: # 超时强制退出
+            # 绝对超时保护：仅在已满足最小样本后退出，避免样本过少导致失真
+            if elapsed >= self.max_duration_per_test and sample_count >= self.min_samples:
                 break
                 
         # 汇总结果
         if not samples_tps:
             return CalibrationMetric(0, 0, 0, 0, 1.0)
-            
-        mean_tps = statistics.mean(samples_tps)
+
+        if len(samples_tps) < self.min_samples:
+            logger.warning(
+                "[Calibrator] P=%s Mode=%s sample count too low (%s < %s).",
+                concurrency,
+                mode_str.upper(),
+                len(samples_tps),
+                self.min_samples,
+            )
+
+        mean_tps = (
+            total_tokens / total_batch_duration if total_batch_duration > 0 else 0.0
+        )
         mean_lat = statistics.mean(samples_lat) if samples_lat else 0
         cv = statistics.stdev(samples_tps) / mean_tps if len(samples_tps) > 1 and mean_tps > 0 else 0.0
         error_rate = errors / total_reqs if total_reqs > 0 else 0
