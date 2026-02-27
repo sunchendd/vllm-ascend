@@ -9,6 +9,7 @@ import os
 import time
 import statistics
 import traceback
+import uuid
 import requests
 from requests.adapters import HTTPAdapter
 from typing import Optional, Tuple, Dict, List, Callable, Union
@@ -108,14 +109,31 @@ class SmartWarmupCalibrator:
         self._enable_spec_callback = enable_spec
         self._disable_spec_callback = disable_spec
 
-    def _generate_prompt(self) -> str:
-        """生成具有代表性的中文Prompt"""
+    def _generate_prompt(self, nonce: Optional[str] = None) -> str:
+        """生成具有代表性的中文Prompt。
+
+        为避免 prefix cache 对校准结果产生系统性偏置，可注入 nonce
+        以确保每个请求前缀不同；同时保持总长度不变。
+        """
         base = "人工智能技术的飞速发展正在深刻改变人类社会的方方面面，从自动驾驶到智能医疗，深度学习算法的应用无处不在。"
         prompt = base
         # 填充到目标长度
         while len(prompt) < self.input_length * 2:
             prompt += base
-        return prompt[:self.input_length]
+        prompt = prompt[:self.input_length]
+
+        if nonce:
+            # 用 nonce 替换尾部，保证长度不变并尽量不影响主语义
+            nonce_text = f" [nonce:{nonce}]"
+            if len(nonce_text) >= len(prompt):
+                return nonce_text[-len(prompt):]
+            return prompt[:-len(nonce_text)] + nonce_text
+
+        return prompt
+
+    def _generate_unique_prompt(self) -> str:
+        """生成去缓存化 prompt，避免校准时命中 prefix cache。"""
+        return self._generate_prompt(nonce=uuid.uuid4().hex)
 
     def _send_request(self, prompt: str) -> Tuple[bool, float, int]:
         """发送请求并计算延迟"""
@@ -150,7 +168,6 @@ class SmartWarmupCalibrator:
         发送一批请求，确保 max_concurrency 下的计算图都被触发和编译。
         """
         logger.info(f"[Calibrator] 正在进行服务预热 (Max Concurrency={self.max_concurrency})...")
-        prompt = self._generate_prompt()
         
         concurrencies_to_warmup = [1, 4]
         if self.max_concurrency > 4:
@@ -161,7 +178,12 @@ class SmartWarmupCalibrator:
             for mode in [True, False]:
                 self._switch_mode(mode)
                 with ThreadPoolExecutor(max_workers=c) as executor:
-                    list(executor.map(lambda _: self._send_request(prompt), range(c)))
+                    futures = [
+                        executor.submit(self._send_request, self._generate_unique_prompt())
+                        for _ in range(c)
+                    ]
+                    for f in as_completed(futures):
+                        f.result()
                     
         logger.info("[Calibrator] 服务预热完成")
 
@@ -188,7 +210,6 @@ class SmartWarmupCalibrator:
         if cache_key in self._cache:
             return self._cache[cache_key]
 
-        prompt = self._generate_prompt()
         samples_tps = []
         samples_lat = []
         errors = 0
@@ -196,7 +217,12 @@ class SmartWarmupCalibrator:
         
         # 预热当前并发级别 (1 round)
         with ThreadPoolExecutor(max_workers=concurrency) as executor:
-            list(executor.map(lambda _: self._send_request(prompt), range(concurrency)))
+            warmup_futures = [
+                executor.submit(self._send_request, self._generate_unique_prompt())
+                for _ in range(concurrency)
+            ]
+            for f in as_completed(warmup_futures):
+                f.result()
 
         start_measure_time = time.perf_counter()
         
@@ -204,7 +230,10 @@ class SmartWarmupCalibrator:
             # 每轮并发请求
             batch_start = time.perf_counter()
             with ThreadPoolExecutor(max_workers=concurrency) as executor:
-                futures = [executor.submit(self._send_request, prompt) for _ in range(concurrency)]
+                futures = [
+                    executor.submit(self._send_request, self._generate_unique_prompt())
+                    for _ in range(concurrency)
+                ]
                 results = [f.result() for f in as_completed(futures)]
             
             batch_duration = time.perf_counter() - batch_start

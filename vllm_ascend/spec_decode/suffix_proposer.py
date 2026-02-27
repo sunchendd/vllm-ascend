@@ -222,6 +222,16 @@ class SuffixDecodingProposer(VllmSuffixDecodingProposer, Proposer):
             pass
 
     @classmethod
+    def _clear_shared_threshold(cls) -> None:
+        try:
+            if cls._shared_threshold_file.exists():
+                cls._shared_threshold_file.unlink()
+        except Exception:
+            pass
+        cls._shared_threshold_cached = None
+        cls._shared_threshold_last_check = time.time()
+
+    @classmethod
     def _read_shared_threshold(cls) -> Optional[int]:
         now = time.time()
         if now - cls._shared_threshold_last_check < CALIBRATE_THRESHOLD_POLL_INTERVAL:
@@ -290,6 +300,8 @@ class SuffixDecodingProposer(VllmSuffixDecodingProposer, Proposer):
                 logger.info(f"[AdaptiveSpec] Loaded cached threshold: {th}")
             else:
                 self._need_first_run_calibration = True
+                self._adaptive_threshold = -1
+                SuffixDecodingProposer._clear_shared_threshold()
                 logger.info(f"[AdaptiveSpec] No cache found. Scheduled calibration.")
 
         # Stats
