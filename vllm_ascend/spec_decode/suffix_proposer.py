@@ -303,6 +303,7 @@ class SuffixDecodingProposer(VllmSuffixDecodingProposer, Proposer):
                 self._adaptive_threshold = -1
                 SuffixDecodingProposer._clear_shared_threshold()
                 logger.info(f"[AdaptiveSpec] No cache found. Scheduled calibration.")
+                self._schedule_auto_calibration()
 
         # Stats
         self._spec_enabled_count = 0
@@ -375,6 +376,25 @@ class SuffixDecodingProposer(VllmSuffixDecodingProposer, Proposer):
         return num_reqs > threshold
 
     # --- Calibration ---
+
+    def _schedule_auto_calibration(self):
+        """Start calibration automatically once service is ready, without waiting for first user request."""
+        def _trigger():
+            tp_rank = get_tensor_model_parallel_rank()
+            should_run = False
+            with SuffixDecodingProposer._calibration_lock:
+                if (not SuffixDecodingProposer._calibration_done
+                        and tp_rank == 0
+                        and not SuffixDecodingProposer._calibration_in_progress):
+                    SuffixDecodingProposer._calibration_in_progress = True
+                    should_run = True
+            if should_run:
+                logger.info("[AdaptiveSpec] Auto-starting calibration (no user request needed)...")
+                self._need_first_run_calibration = False
+                self._run_calibration_async()
+
+        t = threading.Thread(target=_trigger, daemon=True)
+        t.start()
 
     def _run_calibration_async(self):
         """Invoke the SmartWarmupCalibrator in a background thread"""

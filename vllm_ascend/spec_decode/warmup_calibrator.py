@@ -62,15 +62,16 @@ class SmartWarmupCalibrator:
         base_url: str = "http://127.0.0.1:8000",
         model_name: str = "default",
         max_concurrency: int = 64,
-        input_length: int = 1024,
-        output_length: int = 1024,
+        input_length: int = int(os.environ.get("VLLM_ASCEND_CALIBRATE_INPUT_LENGTH", "512")),
+        output_length: int = int(os.environ.get("VLLM_ASCEND_CALIBRATE_OUTPUT_LENGTH", "1024")),
         timeout: float = 300.0,
         # 统计配置
-        min_samples: int = 5,
+        min_samples: int = int(os.environ.get("VLLM_ASCEND_CALIBRATE_MIN_SAMPLES", "3")),
         max_samples: int = 20,
         cv_threshold: float = 0.15,    # 变异系数阈值
         duration_per_test: int = 5,    # 单点测试持续时间(秒)
         winner_margin: float = 0.03,   # 优胜判定阈值 (3%)
+        warmup_output_length: int = int(os.environ.get("VLLM_ASCEND_CALIBRATE_WARMUP_OUTPUT_LENGTH", "64")),
     ):
         self.base_url = base_url
         self.model_name = model_name
@@ -84,6 +85,7 @@ class SmartWarmupCalibrator:
         self.cv_threshold = cv_threshold
         self.duration_per_test = duration_per_test
         self.winner_margin = winner_margin
+        self.warmup_output_length = warmup_output_length
         self.max_duration_per_test = max(
             self.duration_per_test,
             float(os.environ.get(
@@ -151,13 +153,13 @@ class SmartWarmupCalibrator:
         """生成去缓存化 prompt，避免校准时命中 prefix cache。"""
         return self._generate_prompt(nonce=uuid.uuid4().hex)
 
-    def _send_request(self, prompt: str) -> Tuple[bool, float, int]:
+    def _send_request(self, prompt: str, output_length: Optional[int] = None) -> Tuple[bool, float, int]:
         """发送请求并计算延迟"""
         url = f"{self.base_url}/v1/chat/completions"
         payload = {
             "model": self.model_name,
             "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": self.output_length,
+            "max_tokens": output_length if output_length is not None else self.output_length,
             "temperature": self.request_temperature,
             "top_p": self.request_top_p,
             "ignore_eos": self.request_ignore_eos,
@@ -196,7 +198,7 @@ class SmartWarmupCalibrator:
                 self._switch_mode(mode)
                 with ThreadPoolExecutor(max_workers=c) as executor:
                     futures = [
-                        executor.submit(self._send_request, self._generate_unique_prompt())
+                        executor.submit(self._send_request, self._generate_unique_prompt(), self.warmup_output_length)
                         for _ in range(c)
                     ]
                     for f in as_completed(futures):
@@ -237,7 +239,7 @@ class SmartWarmupCalibrator:
         # 预热当前并发级别 (1 round)
         with ThreadPoolExecutor(max_workers=concurrency) as executor:
             warmup_futures = [
-                executor.submit(self._send_request, self._generate_unique_prompt())
+                executor.submit(self._send_request, self._generate_unique_prompt(), self.warmup_output_length)
                 for _ in range(concurrency)
             ]
             for f in as_completed(warmup_futures):
@@ -407,10 +409,24 @@ class SmartWarmupCalibrator:
                     found_crossover_interval = True
                     break
                 elif res.winner == "tie":
-                    # 并列，可能即将交叉
+                    # 偏差 < ±1%，直接认为找到阈值，无需继续搜索
+                    if abs(res.improvement) < 0.01:
+                        logger.info(
+                            f"[Calibrator] P={next_p} 偏差 {res.improvement:+.1%} < ±1%，直接确定阈值 = {next_p}"
+                        )
+                        logger.info("="*60)
+                        logger.info(f"校准完成. 最佳阈值 Threshold = {next_p}")
+                        logger.info(f"含义: 并发数 <= {next_p} 时开启投机推理")
+                        logger.info("="*60)
+                        return WarmupCalibrationResult(
+                            optimal_threshold=next_p,
+                            comparisons=comparisons,
+                            confidence=0.95,
+                            message=f"Near-zero crossover at P={next_p} (diff={res.improvement:+.1%})"
+                        )
+                    # 并列但偏差较大，可能即将交叉，继续往后看
                     interval_start = curr
-                    # 继续往后看
-                
+
                 curr = next_p
                 
             # 如果倍增跑完了都没发现 Direct 赢，再测一下 Max Concurrency
@@ -486,6 +502,13 @@ class SmartWarmupCalibrator:
                 if res.winner == "spec":
                     best_threshold = mid
                     low = mid + 1
+                elif abs(res.improvement) < 0.01:
+                    # 偏差 < ±1%，直接认为是阈值
+                    best_threshold = mid
+                    logger.info(
+                        f"[Calibrator] P={mid} 偏差 {res.improvement:+.1%} < ±1%，直接确定阈值 = {mid}"
+                    )
+                    break
                 else:
                     high = mid - 1
             
