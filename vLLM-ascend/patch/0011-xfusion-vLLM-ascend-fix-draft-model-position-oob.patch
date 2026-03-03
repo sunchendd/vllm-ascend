@@ -1,0 +1,64 @@
+Subject: [PATCH] Fix draft model proposer position OOB crash when context exceeds draft model limit
+
+When the target model supports a larger context (e.g. 128K) than the draft model
+(e.g. Qwen3-0.6B with max_position_embeddings=40960), requests with long context
+cause an out-of-bounds crash in the Ascend CANN gather_v3 operator during position
+embedding lookup.
+
+Root cause: position IDs >= draft_model.max_model_len are passed directly to the
+draft model's embedding layer which only supports [0, max_model_len).
+
+Fix: Use draft_max_model_len (not target max_model_len) for all position clamping
+in DraftModelProposer. For the initial prefill pass, clamp positions exceeding the
+draft model's limit to 0 and mask corresponding slot_mapping entries with
+PADDING_SLOT_ID so the KV cache is not inadvertently written. seq_lens is computed
+from original (unclamped) positions so attention correctness is preserved. Draft
+tokens produced for over-limit positions will be garbage and rejected by the target
+model's verification step, but the service will not crash.
+---
+Index: vllm_ascend/spec_decode/draft_model_proposer.py
+===================================================================
+diff --git a/vllm_ascend/spec_decode/draft_model_proposer.py b/vllm_ascend/spec_decode/draft_model_proposer.py
+--- a/vllm_ascend/spec_decode/draft_model_proposer.py
++++ b/vllm_ascend/spec_decode/draft_model_proposer.py
+@@ -131,6 +131,7 @@
+         self.runner = runner
+ 
+         self.max_model_len = vllm_config.model_config.max_model_len
++        self.draft_max_model_len = vllm_config.speculative_config.draft_model_config.max_model_len
+         max_batch_size = vllm_config.scheduler_config.max_num_seqs
+         self.max_num_tokens = (self.vllm_config.scheduler_config.max_num_batched_tokens + max_batch_size)
+ 
+@@ -261,7 +262,7 @@
+             inputs=inputs,
+             next_token_ids=next_token_ids,
+             block_size=self.block_size,
+-            max_model_len=self.vllm_config.model_config.max_model_len,
++            max_model_len=self.draft_max_model_len,
+             arange=self.arange,
+             cu_num_tokens=cu_num_tokens,
+             num_reqs=self.runner.input_batch.num_reqs))
+@@ -433,6 +434,14 @@
+         # Shift the input ids by one token.
+         self.input_ids[:num_tokens] = target_token_ids
+         seq_lens = (target_positions[last_token_indices] + 1).int()
++        # Clamp positions to draft model's limit to prevent OOB in position embeddings.
++        # seq_lens is computed from original positions (needed for attention correctness).
++        _exceeds_draft = target_positions >= self.draft_max_model_len
++        if _exceeds_draft.any():
++            target_positions = target_positions.clone()
++            target_positions[_exceeds_draft] = 0
++            target_slot_mapping = target_slot_mapping.masked_fill(
++                _exceeds_draft.to(target_slot_mapping.device), PADDING_SLOT_ID)
+ 
+         query_lens = cu_num_tokens[1:] - cu_num_tokens[:-1]
+         max_query_len = query_lens.max().item()
+@@ -542,7 +551,7 @@
+             input_ids = draft_token_ids_tensor[now_speculative].to(device)
+             positions_cpu += 1
+ 
+-            exceeds_max_model_len = positions_cpu >= self.vllm_config.model_config.max_model_len
++            exceeds_max_model_len = positions_cpu >= self.draft_max_model_len
+             # Mask out the position ids that exceed the max model length.
+             # Otherwise, we may get out-of-range error in RoPE.
+             clamped_positions_cpu = torch.where(exceeds_max_model_len, 0, positions_cpu)
