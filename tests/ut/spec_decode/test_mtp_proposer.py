@@ -365,3 +365,134 @@ class TestMtpProposer:
         assert spec_common_attn_metadata.num_actual_tokens == total_num_tokens
         assert spec_common_attn_metadata.max_query_len == 8
         assert spec_common_attn_metadata.actual_seq_lengths_q == proposer.runner.actual_seq_lengths_q
+
+
+class TestMtpProposerAdaptiveDisable:
+    """Tests for the concurrency-based adaptive MTP disable feature."""
+
+    def _make_minimal_proposer(self, num_speculative_tokens: int = 2) -> MtpProposer:
+        """Create a minimal MtpProposer instance without full runner setup."""
+        proposer = MtpProposer.__new__(MtpProposer)
+        proposer.num_speculative_tokens = num_speculative_tokens
+        return proposer
+
+    def _patch_threshold(self, threshold: int):
+        """Patch the env variable lookup for VLLM_ASCEND_MTP_DISABLE_CONCURRENCY_THRESHOLD."""
+        import vllm_ascend.envs as envs_mod
+        original = envs_mod.env_variables["VLLM_ASCEND_MTP_DISABLE_CONCURRENCY_THRESHOLD"]
+        envs_mod.env_variables["VLLM_ASCEND_MTP_DISABLE_CONCURRENCY_THRESHOLD"] = lambda: threshold
+        return original
+
+    def _restore_threshold(self, original):
+        import vllm_ascend.envs as envs_mod
+        envs_mod.env_variables["VLLM_ASCEND_MTP_DISABLE_CONCURRENCY_THRESHOLD"] = original
+
+    def test_mtp_disabled_when_batch_equals_threshold(self):
+        """When batch_size == threshold, _propose returns all-zero draft tokens."""
+        proposer = self._make_minimal_proposer(num_speculative_tokens=2)
+        batch_size = 8
+        threshold = 8  # batch_size == threshold → skip MTP
+
+        original = self._patch_threshold(threshold)
+        try:
+            result = proposer._propose(
+                target_token_ids=torch.zeros(batch_size, dtype=torch.int64),
+                target_positions=torch.zeros(batch_size, dtype=torch.int64),
+                target_hidden_states=torch.zeros(batch_size, 64),
+                next_token_ids=torch.zeros(batch_size, dtype=torch.int64),
+                last_token_indices=None,
+                common_attn_metadata=MagicMock(),
+                sampling_metadata=MagicMock(),
+            )
+        finally:
+            self._restore_threshold(original)
+
+        assert result.shape == (batch_size, proposer.num_speculative_tokens), \
+            "Shape must be (batch_size, num_speculative_tokens)"
+        assert result.sum().item() == 0, \
+            "All draft token ids must be zero when threshold is exceeded"
+        assert result.dtype == torch.int64
+
+    def test_mtp_disabled_when_batch_exceeds_threshold(self):
+        """When batch_size > threshold, _propose returns all-zero draft tokens."""
+        proposer = self._make_minimal_proposer(num_speculative_tokens=3)
+        batch_size = 32
+        threshold = 16  # batch_size(32) > threshold(16) → skip MTP
+
+        original = self._patch_threshold(threshold)
+        try:
+            result = proposer._propose(
+                target_token_ids=torch.zeros(batch_size, dtype=torch.int64),
+                target_positions=torch.zeros(batch_size, dtype=torch.int64),
+                target_hidden_states=torch.zeros(batch_size, 64),
+                next_token_ids=torch.zeros(batch_size, dtype=torch.int64),
+                last_token_indices=None,
+                common_attn_metadata=MagicMock(),
+                sampling_metadata=MagicMock(),
+            )
+        finally:
+            self._restore_threshold(original)
+
+        assert result.shape == (batch_size, proposer.num_speculative_tokens)
+        assert result.sum().item() == 0
+
+    def test_mtp_not_skipped_when_batch_below_threshold(self):
+        """When batch_size < threshold, _propose must NOT early-return zeros but proceed normally."""
+        proposer = self._make_minimal_proposer(num_speculative_tokens=2)
+        # Give proposer minimal attributes so it proceeds past threshold check
+        proposer.pcp_size = 1
+        proposer.dcp_size = 1
+        proposer.speculative_config = MagicMock()
+        proposer.speculative_config.disable_padded_drafter_batch = True
+        proposer.vllm_config = MagicMock()
+        proposer.vllm_config.compilation_config.cudagraph_mode.has_full_cudagraphs.return_value = False
+
+        batch_size = 4
+        threshold = 16  # batch_size(4) < threshold(16) → proceed normally
+
+        original = self._patch_threshold(threshold)
+        try:
+            # The method should NOT short-circuit at threshold check.
+            # It will proceed and fail later due to missing full runner state —
+            # that AttributeError confirms we reached the normal code path.
+            with pytest.raises((AttributeError, TypeError, Exception)):
+                proposer._propose(
+                    target_token_ids=torch.zeros(batch_size, dtype=torch.int64),
+                    target_positions=torch.zeros(batch_size, dtype=torch.int64),
+                    target_hidden_states=torch.zeros(batch_size, 64),
+                    next_token_ids=torch.zeros(batch_size, dtype=torch.int64),
+                    last_token_indices=None,
+                    common_attn_metadata=MagicMock(),
+                    sampling_metadata=MagicMock(),
+                )
+        finally:
+            self._restore_threshold(original)
+
+    def test_threshold_zero_disables_adaptive_feature(self):
+        """When threshold=0 (default), the adaptive disable is inactive; _propose proceeds normally."""
+        proposer = self._make_minimal_proposer(num_speculative_tokens=2)
+        proposer.pcp_size = 1
+        proposer.dcp_size = 1
+        proposer.speculative_config = MagicMock()
+        proposer.speculative_config.disable_padded_drafter_batch = True
+        proposer.vllm_config = MagicMock()
+        proposer.vllm_config.compilation_config.cudagraph_mode.has_full_cudagraphs.return_value = False
+
+        batch_size = 64
+        threshold = 0  # disabled
+
+        original = self._patch_threshold(threshold)
+        try:
+            # With threshold=0, even a large batch should proceed normally (not return zeros early).
+            with pytest.raises((AttributeError, TypeError, Exception)):
+                proposer._propose(
+                    target_token_ids=torch.zeros(batch_size, dtype=torch.int64),
+                    target_positions=torch.zeros(batch_size, dtype=torch.int64),
+                    target_hidden_states=torch.zeros(batch_size, 64),
+                    next_token_ids=torch.zeros(batch_size, dtype=torch.int64),
+                    last_token_indices=None,
+                    common_attn_metadata=MagicMock(),
+                    sampling_metadata=MagicMock(),
+                )
+        finally:
+            self._restore_threshold(original)

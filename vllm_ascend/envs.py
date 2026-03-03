@@ -117,6 +117,12 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_FUSION_OP_TRANSPOSE_KV_CACHE_BY_BLOCK": lambda: bool(
         int(os.getenv("VLLM_ASCEND_FUSION_OP_TRANSPOSE_KV_CACHE_BY_BLOCK", "1"))
     ),
+    # Threshold for disabling MTP speculative decoding based on concurrent request count.
+    # When the current batch size (num_running_requests) >= this value, MTP draft is skipped
+    # to avoid overhead at high concurrency. 0 (default) means always enabled.
+    "VLLM_ASCEND_MTP_DISABLE_CONCURRENCY_THRESHOLD": lambda: int(
+        os.getenv("VLLM_ASCEND_MTP_DISABLE_CONCURRENCY_THRESHOLD", "0")
+    ),
 }
 
 # end-env-vars-definition

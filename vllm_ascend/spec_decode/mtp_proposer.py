@@ -10,6 +10,7 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.spec_decode.eagle import PADDING_SLOT_ID
 from vllm.v1.utils import record_function_or_nullcontext
 
+from vllm_ascend import envs
 from vllm_ascend.ascend_forward_context import set_ascend_forward_context
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
@@ -173,6 +174,18 @@ class MtpProposer(EagleProposer):
         scheduler_output: SchedulerOutput = None,
         num_scheduled_tokens: int = 0,
     ) -> torch.Tensor:
+        # Adaptive disable: skip MTP draft when batch size exceeds concurrency threshold.
+        # At high concurrency, the draft model overhead outweighs speculative gains.
+        _threshold = envs.VLLM_ASCEND_MTP_DISABLE_CONCURRENCY_THRESHOLD
+        if _threshold > 0 and next_token_ids.shape[0] >= _threshold:
+            batch_size = next_token_ids.shape[0]
+            return torch.zeros(
+                batch_size,
+                self.num_speculative_tokens,
+                dtype=torch.int64,
+                device=next_token_ids.device,
+            )
+
         # Currently, both GLM and DS encounter issues when enabling the fullgraph mode and running on EagleProposer.
         # Therefore, we temporarily bypass this problem by adding a conditional check for fullgraph.
         # TODO: this conditional check should be removed after bug fixing.
