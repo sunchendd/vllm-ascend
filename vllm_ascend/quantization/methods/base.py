@@ -79,7 +79,8 @@ class AscendLinearScheme(ABC):
         return {}
 
     def get_pergroup_param(
-        self, input_size: int, output_size: int, params_dtype: torch.dtype, layer_type: str | None = None
+        self, input_size: int, output_size: int, params_dtype: torch.dtype,
+        layer_type: str | None = None, weight_loader: Callable | None = None
     ) -> dict[str, Any]:
         """Return per-group parameter specifications.
 

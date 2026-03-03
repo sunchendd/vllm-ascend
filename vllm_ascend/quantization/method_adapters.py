@@ -24,7 +24,7 @@ from vllm.model_executor.layers.fused_moe import FusedMoEMethodBase, FusedMoeWei
 from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
 from vllm.model_executor.layers.linear import LinearMethodBase, RowParallelLinear
 from vllm.model_executor.layers.quantization.kv_cache import BaseKVCacheMethod
-from vllm.model_executor.parameter import PerTensorScaleParameter
+from vllm.model_executor.parameter import BlockQuantScaleParameter, PerTensorScaleParameter
 from vllm.model_executor.utils import set_weight_attrs
 
 from vllm_ascend.ascend_config import get_ascend_config
@@ -98,20 +98,32 @@ class AscendLinearMethod(LinearMethodBase):
         layer_type = "row" if isinstance(layer, RowParallelLinear) else "others"
 
         pergroup_dict = self.quant_method.get_pergroup_param(
-            input_size_per_partition, output_size_per_partition, params_dtype, layer_type=layer_type
+            input_size_per_partition, output_size_per_partition, params_dtype,
+            layer_type=layer_type, weight_loader=weight_loader
         )
+        # Block-scale parameters (e.g. W8A16FP8) may already be BlockQuantScaleParameter
+        # instances returned from get_pergroup_param. In that case, set layer.weight_block_size.
+        block_size = getattr(self.quant_method, "block_size", None)
+        if block_size is not None and not hasattr(layer, "weight_block_size"):
+            layer.weight_block_size = block_size
         for pergroup_name, pergroup_param in pergroup_dict.items():
-            param = torch.nn.Parameter(pergroup_param, requires_grad=False)
-            set_weight_attrs(param, {"output_dim": 0})
-            layer.register_parameter(pergroup_name, param)
-            set_weight_attrs(param, extra_weight_attrs)
-            if (
-                "weight_scale_second" in pergroup_name
-                or "weight_offset_second" in pergroup_name
-                or is_mx_quant_type(self.quant_method)
-            ):
-                param.input_dim = 1
-                param.input_dim = 1
+            if isinstance(pergroup_param, BlockQuantScaleParameter):
+                # Already a BlockQuantScaleParameter with weight_loader and dims set.
+                # Just register it; skip set_weight_attrs to avoid "overwriting" assertion.
+                param = pergroup_param
+                layer.register_parameter(pergroup_name, param)
+            else:
+                param = torch.nn.Parameter(pergroup_param, requires_grad=False)
+                set_weight_attrs(param, {"output_dim": 0})
+                layer.register_parameter(pergroup_name, param)
+                set_weight_attrs(param, extra_weight_attrs)
+                if (
+                    "weight_scale_second" in pergroup_name
+                    or "weight_offset_second" in pergroup_name
+                    or is_mx_quant_type(self.quant_method)
+                ):
+                    param.input_dim = 1
+                    param.input_dim = 1
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if hasattr(self.quant_method, "process_weights_after_loading"):
@@ -213,6 +225,8 @@ class AscendFusedMoEMethod(FusedMoEMethodBase):
             if hasattr(self.quant_method, "group_size") and self.quant_method.group_size > 0
             else []
         )
+        # Block-scale parameters (e.g. W8A16FP8) use the same loader as group-scale.
+        block_scale_params = getattr(self.quant_method, "block_scale_params", [])
         dynamic_quant_param = self.quant_method.get_dynamic_quant_param(
             num_experts, intermediate_size_per_partition, hidden_size, params_dtype
         )
@@ -221,6 +235,8 @@ class AscendFusedMoEMethod(FusedMoEMethodBase):
             layer.register_parameter(param_key, param)
             set_weight_attrs(param, extra_weight_attrs)
             if any(fields in param_key for fields in per_group_param):
+                param.quant_method = FusedMoeWeightScaleSupported.GROUP.value
+            elif any(fields in param_key for fields in block_scale_params):
                 param.quant_method = FusedMoeWeightScaleSupported.GROUP.value
 
     def apply(

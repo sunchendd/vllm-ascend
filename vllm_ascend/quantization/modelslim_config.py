@@ -451,7 +451,7 @@ class AscendModelSlimConfig(QuantizationConfig):
 
             is_skipped = None
             for shard_prefix in shard_prefixes:
-                is_shard_skipped = self.quant_description[shard_prefix + ".weight"] == "FLOAT"
+                is_shard_skipped = self.quant_description[shard_prefix + ".weight"] in ("FLOAT", "BFLOAT16", "FLOAT16")
 
                 if is_skipped is None:
                     is_skipped = is_shard_skipped
@@ -462,7 +462,7 @@ class AscendModelSlimConfig(QuantizationConfig):
                         "to have the same precision."
                     )
         else:
-            is_skipped = self.quant_description[prefix + ".weight"] == "FLOAT"
+            is_skipped = self.quant_description[prefix + ".weight"] in ("FLOAT", "BFLOAT16", "FLOAT16")
 
         assert is_skipped is not None
         return is_skipped
