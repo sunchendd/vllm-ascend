@@ -1,0 +1,71 @@
+From 28273c3285f58d8b68447895ac529c157f9cd6a7 Mon Sep 17 00:00:00 2001
+From: lianyibo <lianyibo1@kunlunit.com>
+Date: Mon, 22 Dec 2025 17:29:11 +0800
+Subject: [PATCH 3/4] [xfusion]vLLM-ascend: aclgraph adaptation for fp8 and fp4
+
+Offering:AI Solution 25
+CVE:
+Reference:
+Type:feature
+DTS/US:
+reason: aclgraph adaptation for fp8
+
+Signed-off-by: lianyibo lianyibo1@kunlunit.com
+---
+ vllm_ascend/ops/fp4_ops.py |  6 ++++++
+ vllm_ascend/ops/fp8_ops.py | 11 +++++++++++
+ 2 files changed, 17 insertions(+)
+
+diff --git a/vllm_ascend/ops/fp4_ops.py b/vllm_ascend/ops/fp4_ops.py
+index c55d3d9..3e12aba 100644
+--- a/vllm_ascend/ops/fp4_ops.py
++++ b/vllm_ascend/ops/fp4_ops.py
+@@ -97,6 +97,7 @@ def reformat_fp4_weight(weight: torch.Tensor, uint8_len=NUM_BASIC_PER_LOOP * BAS
+     return result.view(shape)
+ 
+ 
++@torch.library.custom_op("npu::fp4_matmul", mutates_args=())
+ def fp4_matmul(x: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor, weight_scale_2: torch.Tensor) \
+     -> torch.Tensor:
+     '''
+@@ -115,3 +116,8 @@ def fp4_matmul(x: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor
+         return _qkv_merged_soft_fp4_matmul(x, weight, weight_scale, weight_scale_2)
+     else:
+         raise ValueError("Unsupported weight_scale_2 size for fp4_matmul.")
++
++
++@fp4_matmul.register_fake
++def _fake_fp4_matmul(x: torch.Tensor, w: torch.Tensor, s1: torch.Tensor, s2: torch.Tensor) -> torch.Tensor:
++    return torch.empty((x.size(0), w.size(0)), dtype=torch.bfloat16, device=x.device)
+diff --git a/vllm_ascend/ops/fp8_ops.py b/vllm_ascend/ops/fp8_ops.py
+index b11cbac..6a86542 100644
+--- a/vllm_ascend/ops/fp8_ops.py
++++ b/vllm_ascend/ops/fp8_ops.py
+@@ -8,6 +8,12 @@ def _dequant_fp8_weight(w: torch.Tensor, s: torch.Tensor, g: torch.Tensor, group
+     return torch_npu.npu_dequant_fp8_weight(w, s, g, group_list_type)
+ 
+ 
++@torch.library.register_fake("npu::npu_dequant_fp8_weight")
++def _fake_dequant_fp8_weight(w: torch.Tensor, s: torch.Tensor, g: torch.Tensor, group_list_type=0):
++    return torch.empty_like(w, dtype=torch.bfloat16)
++
++
++@torch.library.custom_op("npu::fp8_matmul", mutates_args=())
+ def fp8_matmul(x: torch.Tensor, w: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
+     '''
+     x: [M, K], bf16
+@@ -35,6 +41,11 @@ def fp8_matmul(x: torch.Tensor, w: torch.Tensor, s: torch.Tensor) -> torch.Tenso
+             return (x @ dequanted)
+ 
+ 
++@fp8_matmul.register_fake
++def _fake_fp8_matmul(x: torch.Tensor, w: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
++    return torch.empty((x.size(0), w.size(0)), dtype=torch.bfloat16, device=x.device)
++
++
+ def fp8_grouped_matmul(x: torch.Tensor, w: torch.Tensor, s: torch.Tensor, g: torch.Tensor, group_list_type) \
+     -> torch.Tensor:
+     '''
+-- 
+2.43.0
+

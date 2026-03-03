@@ -1,0 +1,35 @@
+From dd7c2e1ed20d754f3040b5d983d0c2f491c88c11 Mon Sep 17 00:00:00 2001
+From: tangjinlong <tangjinlong@xfusion.com>
+Date: Tue, 13 Jan 2026 20:48:38 +0800
+Subject: [PATCH] [xfusion]vLLM-ascend: Fix the issue caused by bugfix
+ torch.npu.synchronize().
+
+Offering:AI Solution 25
+CVE:
+Reference:
+Type: bugfix
+DTS/US:US20251112239442
+reason: Fix the issue caused by bugfix torch.npu.synchronize().
+
+Signed-off-by: tangjinlong <tangjinlong@xfusion.com>
+---
+ vllm_ascend/compilation/acl_graph.py | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/vllm_ascend/compilation/acl_graph.py b/vllm_ascend/compilation/acl_graph.py
+index ab61144..3fc4280 100644
+--- a/vllm_ascend/compilation/acl_graph.py
++++ b/vllm_ascend/compilation/acl_graph.py
+@@ -188,7 +188,8 @@ class ACLGraphWrapper:
+         # before the grph replay of iteration i-1.
+         # To ensure proper ordering, we must call synchronize here before replaying,
+         # so that update_attn_params only executes after the previous graph replay has fully completed.
+-        torch.npu.synchronize()
++        if self.runtime_mode == CUDAGraphMode.FULL:
++            torch.npu.synchronize()
+         entry.aclgraph.replay()
+         return entry.output
+ 
+-- 
+2.33.0
+

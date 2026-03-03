@@ -1,0 +1,518 @@
+Subject: [PATCH] patch_2
+---
+Index: vllm/config/speculative.py
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/vllm/config/speculative.py b/vllm/config/speculative.py
+--- a/vllm/config/speculative.py	(revision 6e25890ef6255658250a01086a4b754ed239de06)
++++ b/vllm/config/speculative.py	(revision 064a33079f1bc1b03fcbc82d748e1d9cd779bc00)
+@@ -46,6 +46,7 @@
+     "draft_model",
+     "suffix",
+     EagleModelTypes,
++    "suffix-draft_model",
+     "suffix-eagle3",
+ ]
+ 
+@@ -64,19 +65,7 @@
+ 
+     num_speculative_tokens_per_method: dict[str, int] = None
+     """The number of speculative tokens for each method, if provided."""
+-    draft_confidence_threshold: float = Field(default=0.0, ge=0.0, le=1.0)
+-    """Confidence threshold for early stopping in EAGLE draft token generation.
+-    When a draft token's confidence (max softmax probability) falls below this
+-    threshold, subsequent tokens will not write to KV cache, saving memory
+-    bandwidth. Set to 0.0 to disable early stopping (always write all tokens).
+-    Set to 1.0 to stop after any non-certain prediction. Default: 0.0 (disabled)."""
+-    draft_length_options: list[int] | None = None
+-    """List of draft lengths to capture as CUDA graphs for adaptive speculative
+-    decoding. If None, auto-computed as [max(2, n//2), n, min(8, n*2)] where
+-    n=num_speculative_tokens. For example, if num_speculative_tokens=5,
+-    defaults to [2, 5, 8]. The system will dynamically select the optimal
+-    draft length based on recent acceptance rates to balance compute cost
+-    vs. speculation benefit."""
++
+     model: str | None = None
+     """The name of the draft model, eagle head, or additional weights, if
+     provided."""
+@@ -163,6 +152,18 @@
+     tokens with estimated probability (based on frequency counts) greater than
+     or equal to this value."""
+ 
++    draft_confidence_threshold: float = Field(default=0.0, ge=0.0, le=1.0)
++    """Confidence threshold for early stopping in draft/eagle token generation.
++    When a draft token's confidence (max softmax probability) falls below this
++    threshold, subsequent tokens will not write to KV cache, saving memory
++    bandwidth. Set to 0.0 to disable early stopping (always write all tokens)."""
++
++    speculative_token_range: list[int] | None = None
++    """List of draft lengths to capture as CUDA graphs for adaptive speculative
++    decoding. For example, if method is draft model num_speculative_tokens=5,
++    defaults to [3, 5]. The system will dynamically select the optimal
++    draft length based on recent acceptance rates to balance compute cost vs. speculation benefit."""
++
+     def compute_hash(self) -> str:
+         """
+         WARNING: Whenever a new field is added to this config,
+@@ -287,6 +288,24 @@
+                     "num_speculative_tokens was provided but without speculative model."
+                 )
+ 
++        if self.method in ("suffix-draft_model", "suffix-eagle3"):
++            assert self.num_speculative_tokens_per_method is not None, (
++                "num_speculative_tokens_per_method must be provided for suffix-draft_model method.")
++            assert self.speculative_token_range is None,(
++                "The “suffix-draft” method only supports a fixed length for speculative tokens.")
++            assert all(isinstance(v, int) and v > 0
++                       for v in self.num_speculative_tokens_per_method.values()), (
++                "All values in num_speculative_tokens_per_method must be positive integers.")
++            self.num_speculative_tokens = max(self.num_speculative_tokens_per_method.values())
++            assert "suffix" in self.num_speculative_tokens_per_method, (
++                "num_speculative_tokens_per_method must contain ngram key for draft-ngram method.")
++            if self.method == "suffix-draft_model":
++                assert "draft_model" in self.num_speculative_tokens_per_method, (
++                    "num_speculative_tokens_per_method must contain draft key for draft-ngram method.")
++            elif self.method == "suffix-eagle3":
++                assert "eagle3" in self.num_speculative_tokens_per_method, (
++                    "num_speculative_tokens_per_method must contain draft key for eagle3 method.")
++
+         # Automatically configure the method for ngram when "model" is used
+         # instead of "method"
+         if self.method is None and (
+@@ -357,7 +376,7 @@
+                 )
+ 
+                 # Automatically detect the method
+-                if self.method in ("eagle", "eagle3", "suffix-eagle3"):
++                if self.method in ("eagle", "eagle3", "suffix-eagle3", "suffix-draft_model"):
+                     pass
+                 # examples:
+                 # yuhuili/EAGLE-LLaMA3-Instruct-8B
+@@ -648,10 +667,10 @@
+         return self.method in ("eagle", "eagle3", "mtp", "suffix-eagle3")
+ 
+     def uses_draft_model(self) -> bool:
+-        return self.method == "draft_model"
++        return self.method in ("draft_model", "suffix-draft_model")
+ 
+     def use_ngram(self) -> bool:
+-        return self.method in ("suffix", "suffix-eagle3")
++        return self.method in ("ngram", "suffix-eagle3", "suffix-draft_model")
+ 
+     def __repr__(self) -> str:
+         method = self.method
+Index: vllm/v1/cudagraph_dispatcher.py
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/vllm/v1/cudagraph_dispatcher.py b/vllm/v1/cudagraph_dispatcher.py
+--- a/vllm/v1/cudagraph_dispatcher.py	(revision 6e25890ef6255658250a01086a4b754ed239de06)
++++ b/vllm/v1/cudagraph_dispatcher.py	(revision 064a33079f1bc1b03fcbc82d748e1d9cd779bc00)
+@@ -68,7 +68,8 @@
+         if uniform_decode and self.cudagraph_mode.has_mode(CUDAGraphMode.FULL):
+             num_reqs = num_tokens_padded // uniform_decode_query_len
+             if (self.vllm_config.speculative_config is not None
+-                and self.vllm_config.speculative_config.method not in ('suffix','ngram','draft_model')):
++                and self.vllm_config.speculative_config.method not in (
++                            'suffix','ngram','draft_model', "suffix-eagle3", "suffix-draft_model")):
+                 assert num_tokens_padded % uniform_decode_query_len == 0
+         else:
+             uniform_decode = False
+Index: vllm/v1/spec_decode/draft_model.py
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/vllm/v1/spec_decode/draft_model.py b/vllm/v1/spec_decode/draft_model.py
+--- a/vllm/v1/spec_decode/draft_model.py	(revision 6e25890ef6255658250a01086a4b754ed239de06)
++++ b/vllm/v1/spec_decode/draft_model.py	(revision 064a33079f1bc1b03fcbc82d748e1d9cd779bc00)
+@@ -38,6 +38,22 @@
+ PADDING_SLOT_ID = -1
+ 
+ 
++def early_stop_by_confidence_initialize(vllm_config, batch_size, device):
++    # Get pad_token_id from draft model config for masking stopped sequences
++    pad_token_id = (
++        vllm_config.speculative_config.draft_model_config.hf_config.pad_token_id
++        if hasattr(vllm_config.speculative_config.draft_model_config.hf_config, "pad_token_id")
++           and vllm_config.speculative_config.draft_model_config.hf_config.pad_token_id is not None
++        else 0)
++    # Continue mask for confidence-based early stopping
++    continue_mask = torch.ones(
++        vllm_config.scheduler_config.max_num_batched_tokens, dtype=torch.bool, device=device)
++    # Initialize continue mask for confidence-based early stopping
++    continue_mask[:batch_size] = True
++
++    return pad_token_id, continue_mask
++
++
+ class DraftModelProposer:
+     def __init__(
+         self,
+@@ -58,7 +74,12 @@
+         self.max_model_len = vllm_config.model_config.max_model_len
+         self.block_size = vllm_config.cache_config.block_size
+         self.dp_rank = vllm_config.parallel_config.data_parallel_rank
+-        self.num_speculative_tokens = self.speculative_config.num_speculative_tokens
++        if self.method == "suffix-draft_model":
++            self.num_speculative_tokens = (self.speculative_config.num_speculative_tokens_per_method["draft_model"])
++        else:
++            self.num_speculative_tokens = self.speculative_config.num_speculative_tokens
++        logger.info(
++            "DraftProposer: method=%s, num_speculative_tokens=%s", self.method, self.num_speculative_tokens)
+         # The drafter can get longer sequences than the target model.
+         max_batch_size = vllm_config.scheduler_config.max_num_seqs
+         self.max_num_tokens = (vllm_config.scheduler_config.max_num_batched_tokens + max_batch_size)
+@@ -161,6 +182,7 @@
+             common_attn_metadata: CommonAttentionMetadata,
+             sampling_metadata: SamplingMetadata,
+             mm_embed_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
++            draft_length: int | None = None,
+     ) -> torch.Tensor:
+         """
+         This function processes the inputs first before calling the .propose()
+@@ -184,6 +206,7 @@
+             target_positions=inputs.positions,
+             common_attn_metadata=inputs.cad,
+             sampling_metadata=sampling_metadata,
++            draft_length=draft_length,
+             last_token_indices=None,
+             mm_embed_inputs=None,
+         )
+@@ -198,6 +221,7 @@
+         common_attn_metadata: CommonAttentionMetadata,
+         sampling_metadata: SamplingMetadata,
+         mm_embed_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
++        draft_length: int | None = None,
+     ) -> torch.Tensor:
+         num_tokens = target_token_ids.shape[0]
+         batch_size = common_attn_metadata.seq_lens_cpu.shape[0]
+@@ -289,7 +313,7 @@
+         logits = self.model.compute_logits(sample_hidden_states)
+ 
+         # Early exit if there is only one draft token to be generated.
+-        if self.num_speculative_tokens == 1:
++        if draft_length == 1:
+             draft_token_ids = logits.argmax(dim=-1)
+             return draft_token_ids.view(-1, 1)
+ 
+@@ -333,19 +357,29 @@
+         common_attn_metadata.query_start_loc_cpu = torch.from_numpy(
+             self.token_arange_np[: batch_size + 1]
+         ).clone()
+-        for token_index in range(self.num_speculative_tokens - 1):
++        pad_token_id, continue_mask = early_stop_by_confidence_initialize(self.vllm_config, batch_size, self.device)
++        confidence_threshold = self.speculative_config.draft_confidence_threshold
++        for token_index in range(draft_length - 1):
++            active_mask = continue_mask[:batch_size]
+             # cast to int32 is crucial when draft model is compiled.
+             # tensor.argmax() returns int64 by default.
+             input_ids = draft_token_ids_list[-1].int()
++            if token_index > 0:
++                input_ids = torch.where(continue_mask[:batch_size], input_ids, pad_token_id)
+             positions += 1
+             exceeds_max_model_len = positions >= self.max_model_len
+             clamped_positions = torch.where(exceeds_max_model_len, 0, positions)
+             # For data integrity when async scheduling, we shouldn't use in place
+             # operations in case they are modified in next step's `prepare_input`
+             # of main model.
+-            common_attn_metadata.seq_lens += 1
++            # common_attn_metadata.seq_lens += 1
++            length_increments = active_mask.to(common_attn_metadata.seq_lens.dtype)
++            common_attn_metadata.seq_lens += length_increments
+             # This is an out-of-place operation to avoid modifying the original tensor.
+-            common_attn_metadata.seq_lens_cpu = common_attn_metadata.seq_lens_cpu + 1
++            # common_attn_metadata.seq_lens_cpu = common_attn_metadata.seq_lens_cpu + 1
++            common_attn_metadata.seq_lens_cpu = (
++                    common_attn_metadata.seq_lens_cpu
++                    + active_mask.cpu().to(common_attn_metadata.seq_lens_cpu.dtype))
+             # For the requests that exceed the max model length, we set the
+             # sequence length to 1 to minimize their overheads in attention.
+             common_attn_metadata.seq_lens.masked_fill_(exceeds_max_model_len, 1)
+@@ -362,6 +396,10 @@
+             # padding tokens.
+             common_attn_metadata.slot_mapping.masked_fill_(exceeds_max_model_len, PADDING_SLOT_ID)
+ 
++            # Gate K/V writes for stopped sequences (confidence-based early stopping)
++            if token_index > 0:
++                stopped_mask = ~continue_mask[:batch_size]
++                common_attn_metadata.slot_mapping[stopped_mask] = PADDING_SLOT_ID
+             # Rebuild attention metadata
+             attn_metadata = attn_metadata_builder.build_for_drafting(  # type: ignore
+                 common_attn_metadata=common_attn_metadata, draft_index=token_index + 1)
+@@ -400,6 +438,12 @@
+             logits = self.model.compute_logits(last_hidden_states[:batch_size])
+             draft_token_ids = logits.argmax(dim=-1)
+             draft_token_ids_list.append(draft_token_ids)
++            # Compute confidence and update continue mask for early stopping
++            probs = logits.softmax(dim=-1, dtype=torch.float32)
++            confidence = probs.max(dim=-1).values
++            if (confidence < confidence_threshold).all():
++                break
++            continue_mask[:batch_size] &= confidence >= confidence_threshold
+ 
+         # [batch_size, num_speculative_tokens]
+         draft_token_ids = torch.stack(draft_token_ids_list, dim=1)
+Index: vllm/v1/spec_decode/eagle.py
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/vllm/v1/spec_decode/eagle.py b/vllm/v1/spec_decode/eagle.py
+--- a/vllm/v1/spec_decode/eagle.py	(revision 6e25890ef6255658250a01086a4b754ed239de06)
++++ b/vllm/v1/spec_decode/eagle.py	(revision 064a33079f1bc1b03fcbc82d748e1d9cd779bc00)
+@@ -48,7 +48,7 @@
+ from vllm.v1.utils import CpuGpuBuffer
+ from vllm.v1.worker.dp_utils import coordinate_batch_across_dp
+ from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
+-
++from vllm.v1.spec_decode.draft_model import early_stop_by_confidence_initialize
+ logger = init_logger(__name__)
+ 
+ PADDING_SLOT_ID = -1
+@@ -414,16 +414,7 @@
+         common_attn_metadata.query_start_loc_cpu = torch.from_numpy(
+             self.token_arange_np[: batch_size + 1]
+         ).clone()
+-        pad_token_id = (
+-            vllm_config.speculative_config.draft_model_config.hf_config.pad_token_id
+-            if hasattr(vllm_config.speculative_config.draft_model_config.hf_config, "pad_token_id")
+-               and vllm_config.speculative_config.draft_model_config.hf_config.pad_token_id is not None
+-            else 0)
+-        # Continue mask for confidence-based early stopping
+-        continue_mask = torch.ones(
+-            vllm_config.scheduler_config.max_num_batched_tokens, dtype=torch.bool, device=device)
+-        # Initialize continue mask for confidence-based early stopping
+-        continue_mask[:batch_size] = True
++        pad_token_id, continue_mask = early_stop_by_confidence_initialize(self.vllm_config, batch_size, self.device)
+         confidence_threshold = self.speculative_config.draft_confidence_threshold
+         for token_index in range(draft_length - 1):
+             active_mask = continue_mask[:batch_size]
+@@ -552,6 +543,8 @@
+             # Compute confidence and update continue mask for early stopping
+             probs = logits.softmax(dim=-1, dtype=torch.float32)
+             confidence = probs.max(dim=-1).values
++            if (confidence < confidence_threshold).all():
++                break
+             continue_mask[:batch_size] &= confidence >= confidence_threshold
+ 
+         # [batch_size, num_speculative_tokens]
+Index: vllm/v1/spec_decode/metrics.py
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/vllm/v1/spec_decode/metrics.py b/vllm/v1/spec_decode/metrics.py
+--- a/vllm/v1/spec_decode/metrics.py	(revision 6e25890ef6255658250a01086a4b754ed239de06)
++++ b/vllm/v1/spec_decode/metrics.py	(revision 064a33079f1bc1b03fcbc82d748e1d9cd779bc00)
+@@ -47,79 +47,33 @@
+             self.num_accepted_tokens_per_pos[i] += 1
+ 
+     def update_acceptance_ewma(self, batch_acceptance_rate: float, batch_count: int):
+-        """Update acceptance EWMA with batch-level acceptance rate.
+-
+-        This should be called once per batch after observing all drafts.
+-
+-        Args:
+-            batch_acceptance_rate: Mean acceptance rate for the batch
+-            batch_count: Number of requests in the batch
+-        """
+-        # Use alpha=0.1 for smoothing (90% history, 10% current)
+-        self.acceptance_rate_ewma = (
+-            0.9 * self.acceptance_rate_ewma + 0.1 * batch_acceptance_rate
+-        )
++        """Update acceptance EWMA with batch-level acceptance rate."""
++        """The impact of the acceptance rates for the recent predictions is 
++        greater on the length of the next prediction."""
++        self.acceptance_rate_ewma = (0.4 * self.acceptance_rate_ewma + 0.6 * batch_acceptance_rate)
+         self.num_requests_tracked += batch_count
+ 
+-    def compute_optimal_draft_length(self, draft_length_options: list[int]) -> int:
++    def compute_optimal_draft_length(self, num_spec_tokens: int, spec_range: list[int]) -> int:
+         """Compute optimal draft length based on acceptance rate.
+-
+-        Uses threshold-based selection with empirically-tuned boundaries:
+-
+-        Threshold Rationale:
+-        - >0.7 (High): Draft tokens are being accepted frequently. Use longest
+-          draft length to maximize speculation benefit. This threshold represents
+-          ~70% average acceptance, meaning most drafts are useful.
+-
+-        - 0.5-0.7 (Medium): Moderate acceptance. Use middle draft length to
+-          balance speculation cost vs. benefit. Below 70%, longer drafts start
+-          seeing diminishing returns.
+-
+-        - 0.3-0.5 (Low): Acceptance dropping. Be conservative with draft length
+-          to avoid wasted computation. 50% is the break-even point where draft
+-          cost equals benefit.
+-
+-        - <0.3 (Very Low): Poor acceptance. Use shortest draft to minimize waste.
+-          Below 30%, speculation is barely helping and we should draft minimally.
+-
+-        These thresholds were chosen based on:
+-        1. Empirical testing across coding, QA, and creative writing workloads
+-        2. Cost-benefit analysis where draft cost ≈ 0.1x verify cost
+-        3. Acceptance rate stability (EWMA smoothing reduces noise)
+-
+-        Args:
+-            draft_length_options: List of available draft lengths (will be sorted)
+-
+-        Returns:
+-            Optimal draft length for current acceptance rate
+-
+-        Note:
+-            For 2-3 options, low and very low both use shortest to be
+-            conservative. With 4+ options, low uses second-shortest to provide
+-            finer-grained control and differentiate from very low acceptance.
+-        """
+-        if not draft_length_options:
+-            return self.num_spec_tokens
+-
+-        # Sort to ensure consistent ordering
+-        sorted_options = sorted(draft_length_options)
+-
++            Optimal draft length for current acceptance rate."""
++        if spec_range is None:
++            return num_spec_tokens
+         # Threshold-based selection
+-        if self.acceptance_rate_ewma > 0.7: 
+-            return sorted_options[-1]  # Longest
+-        elif self.acceptance_rate_ewma > 0.5:
+-            # Medium: use middle option
+-            mid_idx = len(sorted_options) // 2
+-            return sorted_options[mid_idx]
+-        elif self.acceptance_rate_ewma > 0.3:
+-            # Low: use second-shortest if 4+ options, else shortest
+-            # This differentiates from very low when enough options available
+-            if len(sorted_options) >= 4:
+-                return sorted_options[1]
+-            else:
+-                return sorted_options[0]
++        # More refined adjustments to the prediction length.
++        # Stricter requirements for the threshold of token increases.
++        if self.acceptance_rate_ewma > 0.8:
++            if num_spec_tokens < spec_range[-1]:
++                num_spec_tokens += 1
++            return num_spec_tokens
++        elif self.acceptance_rate_ewma > 0.6:
++            return num_spec_tokens
++        elif self.acceptance_rate_ewma > 0.4:
++            if num_spec_tokens > spec_range[0]:
++                num_spec_tokens -= 1
++            return num_spec_tokens
+         else:
+-            return sorted_options[0]  # Very low: shortest
++            num_spec_tokens = spec_range[0]
++            return num_spec_tokens
+ 
+ class SpecDecodingLogging:
+     """Aggregate and log spec decoding metrics.
+Index: vllm/v1/spec_decode/suffix_decoding.py
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/vllm/v1/spec_decode/suffix_decoding.py b/vllm/v1/spec_decode/suffix_decoding.py
+--- a/vllm/v1/spec_decode/suffix_decoding.py	(revision 6e25890ef6255658250a01086a4b754ed239de06)
++++ b/vllm/v1/spec_decode/suffix_decoding.py	(revision 064a33079f1bc1b03fcbc82d748e1d9cd779bc00)
+@@ -14,7 +14,7 @@
+ 
+     def __init__(self, vllm_config: VllmConfig):
+         config = vllm_config.speculative_config
+-        if config.method in ("suffix-eagle3"):
++        if config.method in ("suffix-eagle3", "suffix-draft_model"):
+             self.num_speculative_tokens = (config.num_speculative_tokens_per_method["suffix"])
+         else:
+             self.num_speculative_tokens = config.num_speculative_tokens
+Index: vllm/v1/worker/gpu_model_runner.py
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+--- a/vllm/v1/worker/gpu_model_runner.py	(revision 6e25890ef6255658250a01086a4b754ed239de06)
++++ b/vllm/v1/worker/gpu_model_runner.py	(revision 064a33079f1bc1b03fcbc82d748e1d9cd779bc00)
+@@ -366,6 +366,9 @@
+ 
+         # mm_hash ->  encoder_output
+         self.encoder_cache: dict[str, torch.Tensor] = {}
++        """The purpose of adding predictions is to increase the acceptance rate of the draft model 
++        scheme generated, ensuring that the draft model scheme is used for short-length cases."""
++        self.use_suffix_length : int = 0
+         self.use_aux_hidden_state_outputs = False
+         # Set up speculative decoding.
+         # NOTE(Jiayi): currently we put the entire draft model on
+@@ -379,19 +382,21 @@
+                 self.drafter = NgramProposer(self.vllm_config)
+             if self.speculative_config.method == "suffix":
+                 self.drafter = SuffixDecodingProposer(self.vllm_config)
+-            elif self.speculative_config.method in ("suffix-eagle3"):
++            elif self.speculative_config.method in ("suffix-eagle3", "suffix-draft_model"):
+                 self.drafter_suffix = SuffixDecodingProposer(self.vllm_config)
+             if self.speculative_config.uses_draft_model():
+                 self.drafter = DraftModelProposer(
+                     vllm_config=self.vllm_config,
+                     device=self.device,
+                     runner=self)
++                self.use_suffix_length = 3
+             elif self.speculative_config.use_eagle():
+                 self.drafter = EagleProposer(self.vllm_config, self.device, self)
+                 if self.speculative_config.method == "eagle3":
+                     self.use_aux_hidden_state_outputs = (
+                         self.drafter.eagle3_use_aux_hidden_state
+                     )
++                    self.use_suffix_length = 0
+             elif self.speculative_config.method == "medusa":
+                 self.drafter = MedusaProposer(
+                     vllm_config=self.vllm_config, device=self.device
+@@ -403,7 +408,15 @@
+                 )
+             self.rejection_sampler = RejectionSampler(self.sampler)
+ 
+-            self.draft_length = self.speculative_config.num_speculative_tokens
++            if self.speculative_config is not None and \
++                    self.speculative_config.num_speculative_tokens_per_method is not None:
++                if "eagle3" in self.speculative_config.num_speculative_tokens_per_method:
++                    self.draft_length = self.speculative_config.num_speculative_tokens_per_method["eagle3"]
++                else:
++                    self.draft_length = self.speculative_config.num_speculative_tokens_per_method["draft_model"]
++            else:
++                # Avoid reading the longest value of num_speculative_tokens.
++                self.draft_length = self.speculative_config.num_speculative_tokens
+ 
+             # Initialize spec decoding stats for adaptive draft length
+             from vllm.v1.spec_decode.metrics import SpecDecodingStats
+@@ -3352,7 +3365,7 @@
+             assert isinstance(sampled_token_ids, list)
+             assert isinstance(self.drafter, SuffixDecodingProposer)
+             draft_token_ids = self.drafter.propose(self.input_batch, sampled_token_ids)
+-        elif spec_config.method in ("suffix-eagle3"):
++        elif spec_config.method in ("suffix-eagle3", "suffix-draft_model"):
+             assert isinstance(sampled_token_ids, list)
+             assert isinstance(self.drafter_suffix, SuffixDecodingProposer)
+             draft_token_ids = self.drafter_suffix.propose(self.input_batch, sampled_token_ids)
+@@ -3496,18 +3509,18 @@
+                 draft_length=self.draft_length
+             )
+ 
+-            if self.speculative_config.method in ("suffix-eagle3"):
++            if self.speculative_config.method in ("suffix-eagle3", "suffix-draft_model"):
+                 draft_token_ids_draft = draft_token_ids
+ 
+         # Merge the suffix with eagle/draft, give priority to using the suffix draft.
+-        if self.speculative_config.method in ("suffix-eagle3"):
++        if self.speculative_config.method in ("suffix-eagle3", "suffix-draft_model"):
+             assert draft_token_ids_suffix is not None, "suffix proposer failed"
+             assert draft_token_ids_draft is not None, "draft proposer failed"
+             assert isinstance(draft_token_ids_draft, torch.Tensor)
+             draft_token_ids_draft = draft_token_ids_draft.tolist()
+             draft_token_ids = []
+             for bid in range(len(draft_token_ids_suffix)):
+-                if len(draft_token_ids_suffix[bid]):
++                if len(draft_token_ids_suffix[bid]) > self.use_suffix_length:
+                     draft_token_ids.append(draft_token_ids_suffix[bid])
+                 else:
+                     draft_token_ids.append(draft_token_ids_draft[bid])

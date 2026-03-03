@@ -1,0 +1,238 @@
+From 8340649883e411eb538b057f0f5878204d829852 Mon Sep 17 00:00:00 2001
+From: Isotr0py <mozf@mail2.sysu.edu.cn>
+Date: Wed, 21 Jan 2026 10:00:43 +0800
+Subject: [PATCH 1/4] replace urlparse with parse_url
+
+Signed-off-by: Isotr0py <mozf@mail2.sysu.edu.cn>
+---
+ vllm/multimodal/utils.py | 23 +++++++++++++----------
+ 1 file changed, 13 insertions(+), 10 deletions(-)
+
+diff --git a/vllm/multimodal/utils.py b/vllm/multimodal/utils.py
+index 1020554..c8ad702 100644
+--- a/vllm/multimodal/utils.py
++++ b/vllm/multimodal/utils.py
+@@ -8,13 +8,13 @@ from concurrent.futures import ThreadPoolExecutor
+ from itertools import groupby
+ from pathlib import Path
+ from typing import TYPE_CHECKING, Any, TypeVar
+-from urllib.parse import ParseResult, urlparse
+ from urllib.request import url2pathname
+ 
+ import numpy as np
+ import numpy.typing as npt
+ import torch
+ from PIL import Image, UnidentifiedImageError
++from urllib3.util import Url, parse_url
+ 
+ import vllm.envs as envs
+ from vllm.connections import HTTPConnection, global_http_connection
+@@ -100,10 +100,11 @@ class MediaConnector:
+ 
+     def _load_data_url(
+         self,
+-        url_spec: ParseResult,
++        url_spec: Url,
+         media_io: MediaIO[_M],
+     ) -> _M:  # type: ignore[type-var]
+-        data_spec, data = url_spec.path.split(",", 1)
++        url_spec_path = url_spec.path or ""
++        data_spec, data = url_spec_path.split(",", 1)
+         media_type, data_type = data_spec.split(";", 1)
+ 
+         if data_type != "base64":
+@@ -114,7 +115,7 @@ class MediaConnector:
+ 
+     def _load_file_url(
+         self,
+-        url_spec: ParseResult,
++        url_spec: Url,
+         media_io: MediaIO[_M],
+     ) -> _M:  # type: ignore[type-var]
+         allowed_local_media_path = self.allowed_local_media_path
+@@ -123,7 +124,9 @@ class MediaConnector:
+                 "Cannot load local files without `--allowed-local-media-path`."
+             )
+ 
+-        filepath = Path(url2pathname(url_spec.path))
++        url_spec_path = url_spec.path or ""
++        url_spec_netloc = url_spec.netloc or ""
++        filepath = Path(url2pathname(url_spec_netloc + url_spec_path))
+         if allowed_local_media_path not in filepath.resolve().parents:
+             raise ValueError(
+                 f"The file path {filepath} must be a subpath "
+@@ -132,7 +135,7 @@ class MediaConnector:
+ 
+         return media_io.load_file(filepath)
+ 
+-    def _assert_url_in_allowed_media_domains(self, url_spec) -> None:
++    def _assert_url_in_allowed_media_domains(self, url_spec: Url) -> None:
+         if (
+             self.allowed_media_domains
+             and url_spec.hostname not in self.allowed_media_domains
+@@ -150,9 +153,9 @@ class MediaConnector:
+         *,
+         fetch_timeout: int | None = None,
+     ) -> _M:  # type: ignore[type-var]
+-        url_spec = urlparse(url)
++        url_spec = parse_url(url)
+ 
+-        if url_spec.scheme.startswith("http"):
++        if url_spec.scheme and url_spec.scheme.startswith("http"):
+             self._assert_url_in_allowed_media_domains(url_spec)
+ 
+             connection = self.connection
+@@ -180,10 +183,10 @@ class MediaConnector:
+         *,
+         fetch_timeout: int | None = None,
+     ) -> _M:
+-        url_spec = urlparse(url)
++        url_spec = parse_url(url)
+         loop = asyncio.get_running_loop()
+ 
+-        if url_spec.scheme.startswith("http"):
++        if url_spec.scheme and url_spec.scheme.startswith("http"):
+             self._assert_url_in_allowed_media_domains(url_spec)
+ 
+             connection = self.connection
+-- 
+2.50.1.windows.1
+
+
+From b71a0fc657c791bf829ec2773456486b25a8e92e Mon Sep 17 00:00:00 2001
+From: Isotr0py <mozf@mail2.sysu.edu.cn>
+Date: Wed, 21 Jan 2026 10:06:39 +0800
+Subject: [PATCH 2/4] update remains
+
+Signed-off-by: Isotr0py <mozf@mail2.sysu.edu.cn>
+---
+ vllm/connections.py         | 4 ++--
+ vllm/envs.py                | 4 ++--
+ vllm/utils/network_utils.py | 4 ++--
+ 3 files changed, 6 insertions(+), 6 deletions(-)
+
+diff --git a/vllm/connections.py b/vllm/connections.py
+index 31b0d5e..f79d681 100644
+--- a/vllm/connections.py
++++ b/vllm/connections.py
+@@ -3,10 +3,10 @@
+ 
+ from collections.abc import Mapping, MutableMapping
+ from pathlib import Path
+-from urllib.parse import urlparse
+ 
+ import aiohttp
+ import requests
++from urllib3.util import parse_url
+ 
+ from vllm.version import __version__ as VLLM_VERSION
+ 
+@@ -37,7 +37,7 @@ class HTTPConnection:
+         return self._async_client
+ 
+     def _validate_http_url(self, url: str):
+-        parsed_url = urlparse(url)
++        parsed_url = parse_url(url)
+ 
+         if parsed_url.scheme not in ("http", "https"):
+             raise ValueError(
+diff --git a/vllm/envs.py b/vllm/envs.py
+index d091286..fcaa449 100644
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -421,9 +421,9 @@ def get_vllm_port() -> int | None:
+     try:
+         return int(port)
+     except ValueError as err:
+-        from urllib.parse import urlparse
++        from urllib3.util import parse_url
+ 
+-        parsed = urlparse(port)
++        parsed = parse_url(port)
+         if parsed.scheme:
+             raise ValueError(
+                 f"VLLM_PORT '{port}' appears to be a URI. "
+diff --git a/vllm/utils/network_utils.py b/vllm/utils/network_utils.py
+index 80ff0df..02c016a 100644
+--- a/vllm/utils/network_utils.py
++++ b/vllm/utils/network_utils.py
+@@ -11,12 +11,12 @@ from collections.abc import (
+     Sequence,
+ )
+ from typing import Any
+-from urllib.parse import urlparse
+ from uuid import uuid4
+ 
+ import psutil
+ import zmq
+ import zmq.asyncio
++from urllib3.util import parse_url
+ 
+ import vllm.envs as envs
+ from vllm.logger import init_logger
+@@ -217,7 +217,7 @@ def find_process_using_port(port: int) -> psutil.Process | None:
+ 
+ def split_zmq_path(path: str) -> tuple[str, str, str]:
+     """Split a zmq path into its parts."""
+-    parsed = urlparse(path)
++    parsed = parse_url(path)
+     if not parsed.scheme:
+         raise ValueError(f"Invalid zmq path: {path}")
+ 
+-- 
+2.50.1.windows.1
+
+
+From 1f5ac1c818d4d8cf1798ca312f21d76ea945a828 Mon Sep 17 00:00:00 2001
+From: Isotr0py <mozf@mail2.sysu.edu.cn>
+Date: Wed, 21 Jan 2026 21:44:06 +0800
+Subject: [PATCH 3/4] fix fail test
+
+Signed-off-by: Isotr0py <mozf@mail2.sysu.edu.cn>
+---
+ vllm/utils/network_utils.py | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/vllm/utils/network_utils.py b/vllm/utils/network_utils.py
+index 02c016a..7d01533 100644
+--- a/vllm/utils/network_utils.py
++++ b/vllm/utils/network_utils.py
+@@ -224,6 +224,8 @@ def split_zmq_path(path: str) -> tuple[str, str, str]:
+     scheme = parsed.scheme
+     host = parsed.hostname or ""
+     port = str(parsed.port or "")
++    if host.startswith("[") and host.endswith("]"):
++        host = host[1:-1]  # Remove brackets for IPv6 address
+ 
+     if scheme == "tcp" and not all((host, port)):
+         # The host and port fields are required for tcp
+-- 
+2.50.1.windows.1
+
+
+From 607221390d89979acdb2bf9a2653cafe4b98b694 Mon Sep 17 00:00:00 2001
+From: Isotr0py <mozf@mail2.sysu.edu.cn>
+Date: Thu, 22 Jan 2026 13:58:33 +0800
+Subject: [PATCH 4/4] fix data type parsing
+
+Signed-off-by: Isotr0py <mozf@mail2.sysu.edu.cn>
+---
+ vllm/multimodal/utils.py | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/vllm/multimodal/utils.py b/vllm/multimodal/utils.py
+index c8ad702..69dee56 100644
+--- a/vllm/multimodal/utils.py
++++ b/vllm/multimodal/utils.py
+@@ -106,6 +106,8 @@ class MediaConnector:
+         url_spec_path = url_spec.path or ""
+         data_spec, data = url_spec_path.split(",", 1)
+         media_type, data_type = data_spec.split(";", 1)
++        # media_type starts with a leading "/" (e.g., "/video/jpeg")
++        media_type = media_type.lstrip("/")
+ 
+         if data_type != "base64":
+             msg = "Only base64 data URLs are supported for now."
+-- 
+2.50.1.windows.1
+

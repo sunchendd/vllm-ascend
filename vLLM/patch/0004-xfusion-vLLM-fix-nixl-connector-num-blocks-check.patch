@@ -1,0 +1,31 @@
+From 124d7e1607882db87398c19df7f9bb754cc0032a Mon Sep 17 00:00:00 2001
+From: m00012353 <maaoyu@xfusion.com>
+Date: Mon, 12 Jan 2026 14:09:21 +0800
+Subject: [PATCH] [xfusion]vLLM:fix nixl connector num blocks check logic
+
+CVE:
+Reference:
+Type:bugfix
+DTS/US: issue
+reason: fix nixl connector num blocks check logic
+---
+ vllm/distributed/kv_transfer/kv_connector/v1/nixl_connector.py | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/nixl_connector.py b/vllm/distributed/kv_transfer/kv_connector/v1/nixl_connector.py
+index 41e32bb..dd3ad8c 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/nixl_connector.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/nixl_connector.py
+@@ -1582,7 +1582,8 @@ class NixlConnectorWorker:
+             )
+ 
+         # TP workers have same #blocks.
+-        assert self.dst_num_blocks[remote_engine_id] == nixl_agent_meta.num_blocks
++        if nixl_agent_meta.num_blocks < self.dst_num_blocks[remote_engine_id]:
++            self.dst_num_blocks[remote_engine_id] = nixl_agent_meta.num_blocks
+ 
+         assert len(nixl_agent_meta.kv_caches_base_addr) == len(self.block_len_per_layer)
+ 
+-- 
+2.45.1.windows.1
+

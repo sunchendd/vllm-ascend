@@ -1,0 +1,48 @@
+From c9221fdb1c331152978ee67d1c13110cbb4e8574 Mon Sep 17 00:00:00 2001
+From: tangjinlong <tangjinlong@xfusion.com>
+Date: Mon, 22 Dec 2025 15:41:21 +0800
+Subject: [PATCH 2/4] [xfusion]vLLM-ascend: bugfix the out of memory caused by
+ the encoder cache.
+
+Offering:AI Solution 25
+CVE:
+Reference:
+Type: bugfix
+DTS/US:US20251118241839;US20251118241842;US20251222257068
+reason: bugfix the out of memory caused by the encoder cache.
+
+Signed-off-by: tangjinlong <tangjinlong@xfusion.com>
+---
+ vllm_ascend/worker/worker_v1.py | 16 ++++++++++++++++
+ 1 file changed, 16 insertions(+)
+
+diff --git a/vllm_ascend/worker/worker_v1.py b/vllm_ascend/worker/worker_v1.py
+index bd7bebf..127f9b9 100644
+--- a/vllm_ascend/worker/worker_v1.py
++++ b/vllm_ascend/worker/worker_v1.py
+@@ -253,6 +253,22 @@ class NPUWorker(WorkerBase):
+ 
+         # Get the peak memory allocation recorded by torch
+         peak_memory = torch_npu.npu.memory_stats()["allocated_bytes.all.peak"]
++        # calc encoder cache memory
++        if self.model_config.hf_config.model_type in ['qwen3_vl', 'qwen3_vl_moe']:
++            from vllm.v1.core.encoder_cache_manager import compute_encoder_budget
++            from vllm.multimodal import MULTIMODAL_REGISTRY
++            encoder_compute_budget, encoder_cache_size = compute_encoder_budget(
++                model_config=self.model_config,
++                scheduler_config=self.vllm_config.scheduler_config,
++                mm_registry=MULTIMODAL_REGISTRY,
++            )
++            vision_config = self.model_config.hf_config.vision_config
++            encoder_cache_dim = vision_config.out_hidden_size \
++                * (1 + len(vision_config.deepstack_visual_indexes))
++            encoder_cache_memory_size = encoder_cache_size \
++                * encoder_cache_dim \
++                * torch.tensor([], dtype=self.model_config.dtype).element_size()
++            peak_memory += encoder_cache_memory_size
+         # TODO: don`t need impl this func after empty_cache in
+         # Worker.determine_num_available_blocks() unified`
+         NPUPlatform.empty_cache()
+-- 
+2.43.0
+

@@ -1,0 +1,32 @@
+Subject: [PATCH] GLM-FP8
+---
+Index: vllm/model_executor/models/glm4_moe_mtp.py
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/vllm/model_executor/models/glm4_moe_mtp.py b/vllm/model_executor/models/glm4_moe_mtp.py
+--- a/vllm/model_executor/models/glm4_moe_mtp.py	(revision 064a33079f1bc1b03fcbc82d748e1d9cd779bc00)
++++ b/vllm/model_executor/models/glm4_moe_mtp.py	(revision aadcdc5e3b5ea6000ff4838ffb3e58ac6f75e8d3)
+@@ -106,7 +106,7 @@
+     ) -> torch.Tensor:
+         assert inputs_embeds is not None
+         # masking inputs at position 0, as not needed by MTP
+-        inputs_embeds[positions == 0] = 0
++        inputs_embeds = torch.where(positions.unsqueeze(-1) == 0, 0, inputs_embeds)
+         inputs_embeds = self.enorm(inputs_embeds)
+         previous_hidden_states = self.hnorm(previous_hidden_states)
+ 
+@@ -309,6 +309,12 @@
+                     # Skip loading extra bias for GPTQ models.
+                     if name.endswith(".bias") and name not in params_dict:
+                         continue
++                    # Some checkpoints include weight scale tensors for the
++                    # LM head even when the quantized head isn't built. Skip
++                    # them if the model does not expose a matching parameter
++                    # to avoid KeyError during load.
++                    if name.endswith(".weight_scale") and name not in params_dict:
++                        continue
+ 
+                     # According to DeepSeek-V3 Technical Report, MTP modules
+                     # shares embedding layer. We only load the first weights.

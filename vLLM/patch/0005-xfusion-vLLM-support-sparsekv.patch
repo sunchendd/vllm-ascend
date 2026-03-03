@@ -1,0 +1,1347 @@
+diff -Nur vllm.baseline/vllm/attention/layer.py vllm/vllm/attention/layer.py
+--- vllm.baseline/vllm/attention/layer.py	2025-12-03 17:01:33.000000000 +0800
++++ vllm/vllm/attention/layer.py	2026-02-05 10:23:38.392569867 +0800
+@@ -45,6 +45,7 @@
+     MLAAttentionSpec,
+     SlidingWindowSpec,
+ )
++from vllm.attention.utils.kv_sparse_utils import maybe_execute_sparse_attention_hooks
+ 
+ if current_platform.is_rocm():
+     from vllm.platforms.rocm import on_gfx9
+@@ -827,6 +828,7 @@
+ 
+ 
+ @maybe_transfer_kv_layer
++@maybe_execute_sparse_attention_hooks
+ def unified_attention(
+     query: torch.Tensor,
+     key: torch.Tensor,
+@@ -856,6 +858,7 @@
+ 
+ 
+ @maybe_transfer_kv_layer
++@maybe_execute_sparse_attention_hooks
+ def unified_attention_with_output(
+     query: torch.Tensor,
+     key: torch.Tensor,
+diff -Nur vllm.baseline/vllm/attention/utils/kv_sparse_utils.py vllm/vllm/attention/utils/kv_sparse_utils.py
+--- vllm.baseline/vllm/attention/utils/kv_sparse_utils.py	1970-01-01 08:00:00.000000000 +0800
++++ vllm/vllm/attention/utils/kv_sparse_utils.py	2026-02-05 10:23:38.393569867 +0800
+@@ -0,0 +1,67 @@
++import inspect
++from collections.abc import Callable
++from functools import wraps
++
++import torch
++
++from vllm.forward_context import ForwardContext, get_forward_context
++from vsparse.core import get_sparse_agent, has_sparse_agent, SparseRunnerRole
++
++
++def maybe_execute_sparse_attention_hooks(func: Callable) -> Callable:
++    """
++    Decorator that executes sparse attention hooks before and after
++    the attention computation, if enabled. Otherwise, the wrapper is a no-op.
++
++    On entry: call the start hook of the sparse attention algorithm.
++    On exit: call the end hook of the sparse attention algorithm.
++    """
++
++    sig = inspect.signature(func)
++    param_names = list(sig.parameters.keys())
++
++    # Find the indices of required parameters
++    required_params = {"query", "key", "value", "layer_name"}
++    missing_params = required_params - set(param_names)
++    if missing_params:
++        raise TypeError(
++            f"Function {func.__name__} must have parameters: {required_params}. "
++            f"Missing: {missing_params}"
++        )
++
++    query_idx = param_names.index("query")
++    key_idx = param_names.index("key")
++    value_idx = param_names.index("value")
++    layer_name_idx = param_names.index("layer_name")
++
++    @wraps(func)
++    def wrapper(*args, **kwargs):
++        # Fast path: skip hooks if sparse attention is not enabled
++        if not has_sparse_agent(SparseRunnerRole.WORKER):
++            return func(*args, **kwargs)
++
++        # Extract required parameters from args
++        query: torch.Tensor = args[query_idx]
++        key: torch.Tensor = args[key_idx]
++        value: torch.Tensor = args[value_idx]
++        layer_name: str = args[layer_name_idx]
++
++        # Extract attention context (layer-specific metadata, layer, and kv_cache)
++        forward_context: ForwardContext = get_forward_context()
++        if forward_context.attn_metadata is None:
++            return func(*args, **kwargs)
++
++        # Execute the start hook before attention computation
++        agent = get_sparse_agent(SparseRunnerRole.WORKER)
++        agent.attention_begin(query, key, value, layer_name, forward_context)
++
++        # Execute the original function
++        result = func(*args, **kwargs)
++
++        # Execute the finished hook after attention computation
++        agent.attention_finished(query, key, value, result, layer_name, forward_context)
++
++        return result
++
++    return wrapper
++
+diff -Nur vllm.baseline/vllm/config/__init__.py vllm/vllm/config/__init__.py
+--- vllm.baseline/vllm/config/__init__.py	2025-12-03 17:01:33.000000000 +0800
++++ vllm/vllm/config/__init__.py	2026-02-05 10:23:38.393569867 +0800
+@@ -42,10 +42,16 @@
+     get_layers_from_vllm_config,
+     set_current_vllm_config,
+ )
++from vllm.config.sparse import SparseConfig, CRSAConfig, BMSAConfig, QSAConfig
+ 
+ # __all__ should only contain classes and functions.
+ # Types and globals should be imported from their respective modules.
+ __all__ = [
++    # From vllm.config.sparse
++    "SparseConfig",
++    "CRSAConfig",
++    "BMSAConfig",
++    "QSAConfig",
+     # From vllm.config.cache
+     "CacheConfig",
+     # From vllm.config.compilation
+diff -Nur vllm.baseline/vllm/config/sparse.py vllm/vllm/config/sparse.py
+--- vllm.baseline/vllm/config/sparse.py	1970-01-01 08:00:00.000000000 +0800
++++ vllm/vllm/config/sparse.py	2026-02-05 10:23:38.393569867 +0800
+@@ -0,0 +1,675 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++import hashlib
++import math
++from typing import Any, ClassVar, Literal, Optional, Type, Union, Dict, get_args, TYPE_CHECKING
++from abc import ABC, abstractmethod
++
++from pydantic import SkipValidation, model_validator, field_validator, Field
++from pydantic.dataclasses import dataclass
++from typing_extensions import Self
++
++from vllm.config.utils import config
++from vllm.logger import init_logger
++from .sparse_rules import sparse_config_inferers, crsa_algo_inferers
++if TYPE_CHECKING:
++    from .vllm import VllmConfig
++
++logger = init_logger(__name__)
++
++
++SparseAlgoType = Literal[
++    "QSA",   # Quest Sparse Attention
++    "CRSA",  # Cluster Retrieved Sparse Attention
++    "BMSA"   # Block-Mean Sparse Attention
++    # Others
++]
++
++HeadBudgetPolicy = Literal["uniform", "dynamic"]
++
++LayerPolicyType = Literal["mix", "all_sparse"]
++
++# Registry for sparse algorithm configs
++_SPARSE_ALGO_CONFIG_REGISTRY: dict[str, Type] = {}
++
++
++def register_sparse_algo(algorithm: str):
++    """Decorator to register sparse algorithm configuration classes.
++
++    Args:
++        algorithm: The name of the sparse algorithm.
++
++    Usage:
++        @register_sparse_algo("QSA")
++        @config
++        @dataclass
++        class QuestConfig:
++            ...
++
++    Raises:
++        ValueError: If the algorithm is already registered.
++    """
++
++    def decorator(cls):
++        # Check for duplicate registration
++        if algorithm in _SPARSE_ALGO_CONFIG_REGISTRY:
++            existing_cls = _SPARSE_ALGO_CONFIG_REGISTRY[algorithm]
++            raise ValueError(
++                f"Sparse algorithm '{algorithm}' is already registered with class '{existing_cls.__name__}'.")
++
++        # Warn if algorithm is not in SparseAlgoType Literal
++        valid_algorithms = get_args(SparseAlgoType)
++        if algorithm not in valid_algorithms:
++            logger.warning(
++                f"Registering algorithm '{algorithm}' which is not declared in "
++                f"SparseAlgoType Literal. Valid algorithms are: {valid_algorithms}. ")
++
++        _SPARSE_ALGO_CONFIG_REGISTRY[algorithm] = cls
++
++        # Store algorithm name on class for potential reverse lookup
++        cls._algorithm_name = algorithm
++        return cls
++
++    return decorator
++
++
++@config
++@dataclass
++class BaseSparseAlgoConfig(ABC):
++    """Base class for all sparse algorithm configurations."""
++
++    @abstractmethod
++    def get_blocks_budget(self, prompt_len: int, block_size: int, total_budget: float) -> int:
++        raise NotImplementedError()
++
++    def finalize(self, vllm_config: "VllmConfig") -> None:
++        return
++
++
++@register_sparse_algo("QSA")
++@config
++@dataclass
++class QSAConfig(BaseSparseAlgoConfig):
++    """Configuration for Quest sparse algorithm.
++
++    Quest is a budget-controlled sparse attention mechanism that dynamically
++    selects important tokens based on page's max key.
++    """
++
++    def get_blocks_budget(
++            self,
++            prompt_len: int,
++            block_size: int,
++            total_budget: float,
++    ) -> int:
++        pass
++
++
++@register_sparse_algo("BMSA")
++@config
++@dataclass
++class BMSAConfig(BaseSparseAlgoConfig):
++    """Configuration for Mean Block sparse algorithm.
++
++    BMSA is a budget-controlled sparse attention mechanism that dynamically
++    selects important tokens based on block's mean key.
++    """
++    min_topk_len = 64
++    max_topk_len = 512
++    num_prefetch_blocks = 8
++    init_windows_size = 8
++    ptopk_prefetch_enable = True
++    topk_update_interval = 3
++    align_kv_cache = False
++    enable_cuda_topk = False
++    topk_type: Literal["block-mean", "paged-kmeans"] = "block-mean"
++    kmeans_centroid_topk_ratio: float = 0.20
++    kmeans_topk_backend: Literal["cutlass", "torch"] = "cutlass"
++
++    def get_blocks_budget(
++            self,
++            prompt_len: int,
++            block_size: int,
++            total_budget: float,
++    ) -> int:
++        if prompt_len <= 0:
++            return 0
++        if total_budget is None or total_budget <= 0:
++            return 0
++
++        blocks_len = int(math.ceil(prompt_len / block_size))
++        if total_budget < 1:
++            topk_len = int(math.ceil(blocks_len * float(total_budget)))
++        else:
++            topk_len = int(math.ceil(total_budget / block_size))
++
++        if topk_len < self.min_topk_len:
++            topk_len = min(self.min_topk_len, blocks_len)
++        elif topk_len > self.max_topk_len:
++            topk_len = min(self.max_topk_len, blocks_len)
++        return topk_len
++
++    def finalize(self, vllm_config: "VllmConfig") -> None:
++        kv_transfer_config = getattr(vllm_config, "kv_transfer_config", None)
++        if kv_transfer_config is None:
++            return
++        extra = getattr(kv_transfer_config, "kv_connector_extra_config", None)
++        if extra is None:
++            kv_transfer_config.kv_connector_extra_config = {}
++            extra = kv_transfer_config.kv_connector_extra_config
++
++        sparse_connectors = extra.get("sparse_connectors")
++        if not isinstance(sparse_connectors, list) or not sparse_connectors:
++            return
++
++        has_capacity_hint = False
++        for item in sparse_connectors:
++            if not isinstance(item, dict):
++                continue
++            if item.get("connector_name") != "LocalStoreKVStore":
++                continue
++            connector_config = item.get("connector_config")
++            if (isinstance(connector_config, dict)
++                    and connector_config.get("capacity") is not None):
++                has_capacity_hint = True
++                break
++        if not has_capacity_hint:
++            return
++
++        from vllm.utils.torch_utils import get_kv_cache_torch_dtype
++        import torch
++
++        kv_cache_dtype = get_kv_cache_torch_dtype(
++            vllm_config.cache_config.cache_dtype,
++            vllm_config.model_config.dtype,
++        )
++        elem_size = int(torch.tensor([], dtype=kv_cache_dtype).element_size())
++        head_size = int(vllm_config.model_config.get_head_size())
++        num_kv_heads = int(
++            vllm_config.model_config.get_num_kv_heads(vllm_config.parallel_config))
++        num_layers = int(
++            vllm_config.model_config.get_num_layers(vllm_config.parallel_config))
++        block_size = int(vllm_config.cache_config.block_size)
++        is_mla = bool(getattr(vllm_config.model_config, "is_deepseek_mla", False))
++
++        tensor_size = block_size * num_kv_heads * head_size * elem_size
++        kv_block_size = tensor_size * num_layers * (1 if is_mla else 2)
++        if kv_block_size <= 0:
++            return
++
++        for item in sparse_connectors:
++            if not isinstance(item, dict):
++                continue
++            if item.get("connector_name") != "LocalStoreKVStore":
++                continue
++            connector_config = item.get("connector_config")
++            if connector_config is None or not isinstance(connector_config, dict):
++                connector_config = {}
++                item["connector_config"] = connector_config
++            capacity_gb = connector_config.get("capacity", None)
++            if capacity_gb is None:
++                continue
++            try:
++                capacity_gb_f = float(capacity_gb)
++            except (TypeError, ValueError):
++                continue
++            if capacity_gb_f <= 0:
++                continue
++
++            capacity_bytes = int(math.ceil(capacity_gb_f * (1024**3)))
++            capacity_blocks = max(int(math.ceil(capacity_bytes / kv_block_size)), 1)
++            connector_config["capacity"] = capacity_blocks
++
++
++@register_sparse_algo("CRSA")
++@config
++@dataclass
++class CRSAConfig(BaseSparseAlgoConfig):
++    """Configuration for ClusterRetrieved sparse algorithm.
++
++    ClusterRetrieved uses clustering-based retrieval to identify relevant tokens
++    for attention computation, significantly reducing memory and compute overhead.
++    """
++
++    num_sink_blocks: Optional[int] = None
++    """Number of token blocks at the beginning of the context sequence (attention sink).
++    This value may vary across different model architectures. Set to 'auto' to let the
++    engine automatically determine the optimal value based on the model."""
++
++    num_local_window_blocks: Optional[int] = None
++    """Number of token blocks at the end of the context sequence (local window).
++    This value may vary across different model architectures. Set to 'auto' to let the
++    engine automatically determine the optimal value based on the model."""
++
++    num_prefetch_blocks: Optional[int] = None
++    """Number of token blocks to prefetch before each iteration. Increasing this value may 
++    improve the hit rate of HotCache blocks, but it also incurs additional computational overhead.
++    """
++
++    dual_retrieved_buffer: bool = True
++    """Whether to allocate and use an extra retrieved-zone workspace buffer.
++
++    When enabled (default), CRSA may keep an extra set of retrieved KV blocks so
++    asynchronous recall can write into the inactive buffer and swap the retrieved
++    block-table view at the next step. This reduces read/write conflicts at the
++    cost of extra KV cache memory.
++    """
++
++    num_centroids: Optional[int] = None
++    """Number of cluster centroids. This determines how many clusters the context is
++    divided into. For example, if context length is 64K and n_centroids is 2048,
++    each cluster contains approximately: 65536 / 2048 ≈ 32 tokens/cluster.
++    Recommended value: context_length / 16 to context_length / 32."""
++
++    num_segments: Optional[int] = None
++    """Number of segments for segmented clustering. Used to accelerate the clustering
++    process while maintaining high semantic cohesion within each cluster. For example,
++    if context length is 64K, n_centroids is 2048, and n_segment is 8, then every 8K
++    tokens form a segment, and K-Means clustering is performed on each segment to get:
++    2048 / 8 = 256 clusters per segment."""
++
++    new_cluster_generated_threshold: int = 1024
++    """Cumulative generated token threshold that triggers new cluster updates.
++    When the number of newly generated tokens exceeds this threshold, the clustering
++    index will be updated to include the new tokens."""
++
++    num_centroids_per_iter: int = 64
++    """Number of new cluster centroids added per update iteration. For example,
++    1024 / 64 = 16 tokens/cluster, which is denser than the initial 32 tokens/cluster,
++    because the local window is more important for generation quality."""
++
++    max_compute_cluster_num: Optional[int] = None
++    """Maximum number of clusters to consider. Supports automatic inference, which is
++    the sum of clusters in the retrieval region and the estimation region."""
++
++    sparse_gpu_memory_utilization: float = Field(default=0.1, gt=0, le=1)
++    """GPU memory utilization reserved for sparse requests. Value should be between
++    0.0 and 1.0, representing the fraction of GPU memory pre-allocated for sparse
++    attention data structures (e.g., clustering indices, retrieval buffers)."""
++
++    full_kv_cpu_buffer: float = 128
++    """Size of the CPU full kv buffer per GPU (in GiB)."""
++
++    pipeline_window_size: int = Field(default=2, ge=1)
++    """Pipeline window size for step-stale TopK usage.
++    - 1: fully synchronous (TopK_t and KV recall happen in the same step t).
++    - >1: allow using TopK from previous steps (bounded staleness) to overlap
++      TopK/IO with attention compute.
++    """
++
++    sparsify_generated_tokens: bool = False
++    """Whether to apply sparsification to generated (decode) tokens.
++
++    Current CRSA production semantics only sparsify prompt tokens; generated tokens
++    remain fully kept in GPU KV to preserve simplicity and stability.
++    """
++
++    @model_validator(mode='after')
++    def _verify_model_args(self) -> Self:
++        """Verify CRSA configuration."""
++        if self.sparsify_generated_tokens:
++            raise ValueError(
++                "CRSAConfig.sparsify_generated_tokens=True is not supported in this "
++                "version. Current CRSA only sparsifies prompt tokens; generated "
++                "tokens are kept dense."
++            )
++        return self
++
++    def finalize(self, vllm_config: "VllmConfig"):
++        """
++        finalize: support field value auto inferable.
++        this method will be called after vllm_config.__post_init__().
++        """
++        crsa_algo_inferers.run(self, vllm_config)
++
++    def get_blocks_budget(
++            self,
++            blocks_len: int,
++            block_size: int,
++            total_budget: float,
++    ) -> int:
++        """
++        Note, blocks_len is prompts_len in CRSA.
++        """
++        if total_budget is None or total_budget <= 0:
++            return 0
++
++        if total_budget < 1:
++            budget_tokens = int(math.ceil(blocks_len * float(total_budget)))
++        else:
++            budget_tokens = int(total_budget)
++
++        budget_tokens = min(budget_tokens, int(blocks_len))
++        return int(math.ceil(budget_tokens / int(block_size)))
++
++
++# Union type for all algorithm-specific configs
++AlgorithmConfig = Union[
++    QSAConfig,
++    CRSAConfig,
++    BMSAConfig,
++]
++
++
++@config
++@dataclass
++class LayerSparsePolicy:
++    """Configuration for layer-wise sparse policy.
++
++    Allows hybrid configurations where some layers use sparse attention while
++    others use full attention.
++    """
++
++    policy_type: LayerPolicyType = "all_sparse"
++    """Layer sparsification strategy:\n
++    - 'mix': Mixed mode, where some layers use sparse attention and others use full attention.
++             When this mode is enabled, either full_attn_layers or sparse_layers must be specified.\n
++    - 'all_sparse': All layers use sparse attention."""
++
++    full_attn_layers: Optional[list[int]] = None
++    """List of layer indices that should use full attention (dense attention).
++    Only effective when policy_type is 'mix'. Example: [0, 1, 2, 31] means layers
++    0, 1, 2, and 31 will use full attention while other layers use sparse attention.
++    Cannot be specified together with sparse_layers."""
++
++    sparse_layers: Optional[list[int]] = None
++    """List of layer indices that should use sparse attention.
++    Only effective when policy_type is 'mix'. Example: [3, 4, 5, 30] means layers
++    3, 4, 5, and 30 will use sparse attention while other layers use full attention.
++    Cannot be specified together with full_attn_layers."""
++
++    @model_validator(mode='after')
++    def _verify_layer_policy(self) -> Self:
++        """Validate layer policy configuration."""
++        if self.policy_type == "mix":
++            # Exactly one of full_attn_layers or sparse_layers must be specified
++            if self.full_attn_layers is None and self.sparse_layers is None:
++                raise ValueError(
++                    "When policy_type is 'mix', either full_attn_layers or "
++                    "sparse_layers must be specified.")
++
++            if self.full_attn_layers is not None and self.sparse_layers is not None:
++                raise ValueError(
++                    "Cannot specify both full_attn_layers and sparse_layers. "
++                    "Please specify only one of them.")
++
++            # Validate layer indices are non-negative
++            layers_to_check = self.full_attn_layers or self.sparse_layers
++            if layers_to_check and any(idx < 0 for idx in layers_to_check):  # type: ignore
++                raise ValueError("Layer indices must be non-negative.")
++
++        elif self.policy_type == "all_sparse":
++            # Warn if layers are specified but will be ignored
++            if self.full_attn_layers is not None or self.sparse_layers is not None:
++                logger.warning(
++                    "policy_type is 'all_sparse', but full_attn_layers or "
++                    "sparse_layers is specified. These will be ignored.")
++
++        return self
++
++
++def _get_config_type_for_algo(algorithm: str) -> Type:
++    """Get the configuration class type for a given algorithm.
++
++    Args:
++        algorithm: The name of the sparse algorithm.
++
++    Returns:
++        The configuration class for the specified algorithm.
++
++    Raises:
++        ValueError: If the algorithm is not registered.
++    """
++    if algorithm not in _SPARSE_ALGO_CONFIG_REGISTRY:
++        available = list(_SPARSE_ALGO_CONFIG_REGISTRY.keys())
++        raise ValueError(
++            f"Unknown sparse algorithm: '{algorithm}'. "
++            f"Available algorithms: {available}")
++    return _SPARSE_ALGO_CONFIG_REGISTRY[algorithm]
++
++
++def get_registered_sparse_algos() -> list[str]:
++    """Get list of all registered sparse algorithms.
++
++    Returns:
++        A list of registered algorithm names.
++    """
++    return list(_SPARSE_ALGO_CONFIG_REGISTRY.keys())
++
++
++@config
++@dataclass
++class SparseConfig:
++    """Configuration for Sparse KV cache and Sparse Attention.
++
++    Sparse attention can significantly reduce memory footprint and
++    computation cost for long context scenarios by selectively attending to
++    relevant tokens instead of all tokens in the sequence.
++    """
++
++    DEFAULT_MAX_NUM_SEQS: ClassVar[int] = 32
++
++    enable_sparse: bool = False
++    """Enable/Disable sparse attention. When set to True, sparse
++    inference is enabled. When False, all other sparse-related configurations are
++    ignored and standard dense attention is used."""
++
++    lc_sparse_threshold: Optional[int] = None
++    """Context length threshold to activate sparse attention. If specified,
++    sparse attention is only activated when the sequence length exceeds this
++    threshold. If None, sparse attention is controlled solely by `enable_sparse`.
++    This allows using dense attention for short sequences and sparse attention
++    for long sequences to balance accuracy and efficiency. This threshold is 
++    automatically evaluated by the sparsity algorithm in actual environment."""
++
++    sparse_algo_type: SparseAlgoType = "BMSA"
++    """Sparse attention algorithm to use. Supported algorithms:\n
++    - "QSA": Quest sparse attention with budget control\n
++    - "CRSA": Retrieval-augmented attention using clustering\n
++    - "BMSA": Mean Block Sparse Attention\n
++    """
++
++    sparse_algo_config: Optional[AlgorithmConfig] = None
++    """Algorithm-specific configuration. The type should match the selected
++    `sparse_algo_type`. If None, default configuration for the algorithm will
++    be used.
++    """
++
++    enable_static_sparse: bool = False
++    """Whether to enable static sparse methods. Reserved for future static sparse
++    techniques such as SnapKV, Ada-KV, H2O, etc."""
++
++    max_num_seqs: int = Field(default=DEFAULT_MAX_NUM_SEQS, ge=1)
++    """Maximum number of requests to enable sparse attention.
++    If the number of requests exceeds this threshold, sparse attention will be disabled.
++    """
++
++    head_budget_policy: HeadBudgetPolicy = "uniform"
++    """Head-granularity budget allocation policy:\n
++    - 'uniform': Uniform distribution of budget across all attention heads\n
++    - 'dynamic': Dynamic allocation based on context length, model parameters,
++      and attention head patterns. The inference engine will dynamically allocate
++      token budget for each head.\n
++    """
++
++    total_budget: float = 0.3
++    """Total token budget for sparse attention, default is 30%.\n
++
++    Notes:\n
++    - 0 is allowed (disables sparse attention).\n
++    - The value must not exceed the model's maximum context length.\n
++    - When the value is less than 1, the budget is set based on the percentage count, 
++      otherwise, it is set according to the specific given value.\n
++    """
++
++    topk_oversample: float = Field(default=1.25, gt=0)
++    """TopK oversample ratio for CRSA.\n
++\n
++    This is only used when `sparse_algo_type == "CRSA"`.\n
++\n
++    Motivation:\n
++    - CRSA retrieves tokens by selecting TopK clusters, but clusters can be highly imbalanced
++      (small clusters / empty clusters).\n
++    - Oversampling clusters increases the chance that recalled tokens can fully fill the
++      sparse retrieved KVBlocks budget.\n
++    """
++
++    enable_dynamic_budgets: bool = True
++    """Enable dynamic budgets, which allows the system to automatically determine the 
++    sparsity budget based on variations such as prompt length and model specifications.\n
++    When enable_dynamic_budgets is set to True, the value of total_budgets will be ignored.\n"""
++
++    layer_policy: Optional[LayerSparsePolicy] = None
++    """Layer-wised sparse policy. Allows hybrid configurations where some layers
++    use sparse attention while others use full attention. If None, defaults to
++    LayerSparsePolicy(policy_type='all_sparse')."""
++
++    def finalize(self, vllm_config: "VllmConfig"):
++        """
++        finalize: support field value auto inferable.
++        this method will be called after vllm_config.__post_init__().
++        """
++
++        # 1.finalize sparse_config
++        sparse_config_inferers.run(self, vllm_config)
++
++        # 2.finalize sparse_algo_config
++        self.sparse_algo_config.finalize(vllm_config)
++
++    def __post_init__(self) -> None:
++
++        if not self.enable_sparse:
++            return
++
++        if self.total_budget is not None and self.total_budget <= 0:
++            logger.warning(
++                f"Sparse attention is enabled but budgets are less than 0, force to disable sparse attention."
++            )
++            self.enable_sparse = False
++            return
++
++        # Set default algorithm config if not provided
++        if self.enable_sparse and self.sparse_algo_config is None:
++            config_class = _get_config_type_for_algo(self.sparse_algo_type)
++            self.sparse_algo_config = config_class()
++
++            logger.info(
++                f"Using default configuration for sparse algorithm "
++                f"'{self.sparse_algo_type}': {self.sparse_algo_config}"
++            )
++
++        # Set default layer policy if not provided
++        if self.layer_policy is None:
++            self.layer_policy = LayerSparsePolicy()
++
++        if self.lc_sparse_threshold is not None and self.lc_sparse_threshold < 0:
++            raise ValueError(
++                f"lc_sparse_threshold must be non-negative, but got "
++                f"{self.lc_sparse_threshold}"
++            )
++
++        if self.sparse_algo_type == "CRSA" and self.lc_sparse_threshold is None:
++            self.lc_sparse_threshold = 8 * 1024
++
++        # Complex validation only if sparse is enabled
++        self._verify_sparse_config()
++
++    def get_blocks_budget(self, prompt_len: int, block_size: int) -> int:
++        if prompt_len <= 0:
++            return 0
++        if block_size <= 0:
++            raise ValueError("block_size must be positive")
++
++        assert self.sparse_algo_config is not None
++        return self.sparse_algo_config.get_blocks_budget(prompt_len, block_size, self.total_budget)
++
++    def _verify_sparse_config(self) -> None:
++        """Verify the sparse configuration is valid.
++
++        This is called from @model_validator to ensure all Pydantic
++        validations have completed before we do isinstance checks.
++        """
++        # Verify sparse algorithm is valid and registered
++        valid_algorithms = get_args(SparseAlgoType)
++        if self.sparse_algo_type not in valid_algorithms:
++            raise ValueError(
++                f"Unknown sparse algorithm: '{self.sparse_algo_type}'. "
++                f"Must be one of {valid_algorithms}"
++            )
++
++        # Verify the algorithm is actually registered
++        if self.sparse_algo_type not in _SPARSE_ALGO_CONFIG_REGISTRY:
++            raise ValueError(
++                f"Sparse algorithm '{self.sparse_algo_type}' is declared in "
++                f"SparseAlgoType but has no registered configuration class. "
++                f"Registered algorithms: {get_registered_sparse_algos()}"
++            )
++
++        # Verify algo_config matches the selected algorithm
++        if self.sparse_algo_config is not None:
++            expected_config_type = _get_config_type_for_algo(self.sparse_algo_type)
++            if not isinstance(self.sparse_algo_config, expected_config_type):
++                raise ValueError(
++                    f"sparse_algo_config type mismatch: expected "
++                    f"{expected_config_type.__name__} for algorithm "
++                    f"'{self.sparse_algo_type}', but got "
++                    f"{type(self.sparse_algo_config).__name__}"
++                )
++
++    def compute_hash(self) -> str:
++        """
++        Provide a hash that uniquely identifies all the configs
++        that affect the computation graph structure.
++        """
++        if not self.enable_sparse:
++            return hashlib.md5(b"sparse_disabled",
++                               usedforsecurity=False).hexdigest()
++
++        factors: list[Any] = []
++        factors.append(self.enable_sparse)
++        factors.append(self.lc_sparse_threshold)
++        factors.append(self.sparse_algo_type)
++        factors.append(self.enable_static_sparse)
++        factors.append(self.head_budget_policy)
++        factors.append(self.total_budget)
++
++        # Add layer policy
++        if self.layer_policy is not None:
++            factors.append(self.layer_policy.policy_type)
++            factors.append(str(self.layer_policy.full_attn_layers))
++            factors.append(str(self.layer_policy.sparse_layers))
++
++        if self.sparse_algo_config is not None:
++            factors.append(str(self.sparse_algo_config))
++
++        hash_str = hashlib.md5(str(factors).encode(),
++                               usedforsecurity=False).hexdigest()
++        return hash_str
++
++    def metrics_info(self) -> dict[str, str]:
++        """Convert config to dict for prometheus metrics info."""
++        info = {
++            "enable_sparse": str(self.enable_sparse),
++            "lc_sparse_threshold": str(self.lc_sparse_threshold),
++            "sparse_algo_type": str(self.sparse_algo_type),
++            "enable_static_sparse": str(self.enable_static_sparse),
++            "head_budget_policy": str(self.head_budget_policy),
++            "total_budget": str(self.total_budget) if self.total_budget > 100 else (str(self.total_budget) + "%"),
++        }
++
++        # Add layer policy info
++        if self.layer_policy is not None:
++            info["layer_policy.policy_type"] = str(self.layer_policy.policy_type)
++            info["layer_policy.full_attn_layers"] = str(self.layer_policy.full_attn_layers)
++            info["layer_policy.sparse_layers"] = str(self.layer_policy.sparse_layers)
++
++        if self.sparse_algo_config is not None:
++            algo_config_dict = {
++                f"sparse_algo_config.{key}": str(value)
++                for key, value in self.sparse_algo_config.__dict__.items()
++            }
++            info.update(algo_config_dict)
++
++        return info
++
+diff -Nur vllm.baseline/vllm/config/sparse_rules.py vllm/vllm/config/sparse_rules.py
+--- vllm.baseline/vllm/config/sparse_rules.py	1970-01-01 08:00:00.000000000 +0800
++++ vllm/vllm/config/sparse_rules.py	2026-02-05 10:23:38.393569867 +0800
+@@ -0,0 +1,101 @@
++from pydantic.dataclasses import dataclass
++from typing import Optional, Any, Callable, Protocol, TYPE_CHECKING
++from dataclasses import field as dataclass_field
++
++if TYPE_CHECKING:
++    from .vllm import VllmConfig
++    from .sparse import SparseConfig, CRSAConfig
++from vllm.logger import init_logger
++
++logger = init_logger(__name__)
++
++
++class AutoInferable(Protocol):
++    """
++    AutoInferable: All Sparse Config Classes should inherit
++    from this class to support auto-inferable methods.
++    """
++    def finalize(self, context_b: Any, context_c: Any) -> None:
++        ...
++
++
++class FieldAutoInfererRegistry:
++    def __init__(self):
++        self._inferers: list[Callable] = []
++
++    def register(self, inferer: Callable):
++        self._inferers.append(inferer)
++        return inferer
++
++    def run(self, instance: Any, context: "VllmConfig"):
++        for inferer in self._inferers:
++            try:
++                inferer(instance, context)
++            except Exception as e:
++                logger.error(f"Field Value Auto Inference failed for {inferer.__name__}: {e}")
++
++
++sparse_config_inferers = FieldAutoInfererRegistry()
++crsa_algo_inferers = FieldAutoInfererRegistry()
++
++
++@sparse_config_inferers.register
++def inferer_total_budgets(instance: "SparseConfig", context: "VllmConfig"):
++    """
++    Rules:
++        1.预算不能超出max_model_len
++    """
++    if instance.sparse_algo_type == "CRSA" and not instance.enable_dynamic_budgets:
++        model_config = context.model_config
++        total_budget = instance.total_budget
++
++        if total_budget > model_config.max_model_len:
++            raise ValueError(
++                f"sparse total_budget {total_budget} > {model_config.max_model_len}, this is not allowed.")
++
++
++@crsa_algo_inferers.register
++def inferer_num_sink_blocks(instance: "CRSAConfig", context: "VllmConfig"):
++    """
++    Rules:
++        1.Model
++        2.Block Size
++    """
++    if instance.num_sink_blocks is None:
++        block_size = context.cache_config.block_size
++        if block_size <= 128:
++            instance.num_sink_blocks = 2
++        else:
++            instance.num_sink_blocks = 1
++
++
++@crsa_algo_inferers.register
++def inferer_num_local_window_blocks(instance: "CRSAConfig", context: "VllmConfig"):
++    """
++    Rules:
++        1.Model
++        2.Block Size
++    """
++    if instance.num_local_window_blocks is None:
++        block_size = context.cache_config.block_size
++        if block_size <= 128:
++            instance.num_local_window_blocks = 16
++        else:
++            instance.num_local_window_blocks = 8
++
++
++@crsa_algo_inferers.register
++def inferer_num_prefetch_blocks(instance: "CRSAConfig", context: "VllmConfig"):
++    """
++    Rules:
++        1.Model
++        2.Block Size
++        3.Budgets
++    """
++    if instance.num_prefetch_blocks is None:
++        block_size = context.cache_config.block_size
++        if block_size <= 128:
++            instance.num_prefetch_blocks = 8
++        else:
++            instance.num_prefetch_blocks = 4
++
+diff -Nur vllm.baseline/vllm/config/vllm.py vllm/vllm/config/vllm.py
+--- vllm.baseline/vllm/config/vllm.py	2025-12-03 17:01:33.000000000 +0800
++++ vllm/vllm/config/vllm.py	2026-02-05 10:23:38.393569867 +0800
+@@ -42,6 +42,7 @@
+ from .speculative import SpeculativeConfig
+ from .structured_outputs import StructuredOutputsConfig
+ from .utils import SupportsHash, config
++from .sparse import SparseConfig
+ 
+ if TYPE_CHECKING:
+     from transformers import PretrainedConfig
+@@ -221,6 +222,8 @@
+     """The configurations for event publishing."""
+     ec_transfer_config: ECTransferConfig | None = None
+     """The configurations for distributed EC cache transfer."""
++    sparse_config: SparseConfig | None = None
++    """The configurations for sparse attention."""
+     # some opaque config, only used to provide additional information
+     # for the hash computation, mainly used for testing, debugging or out of
+     # tree config registration.
+@@ -961,6 +964,8 @@
+ 
+         # Handle the KV connector configs
+         self._post_init_kv_transfer_config()
++        if self.sparse_config is not None and self.sparse_config.enable_sparse:
++            self.sparse_config.finalize(self)
+ 
+     def update_sizes_for_sequence_parallelism(self, possible_sizes: list) -> list:
+         # remove the sizes that not multiple of tp_size when
+diff -Nur vllm.baseline/vllm/engine/arg_utils.py vllm/vllm/engine/arg_utils.py
+--- vllm.baseline/vllm/engine/arg_utils.py	2026-02-05 10:21:20.638578078 +0800
++++ vllm/vllm/engine/arg_utils.py	2026-02-05 10:23:38.393569867 +0800
+@@ -54,6 +54,7 @@
+     StructuredOutputsConfig,
+     VllmConfig,
+     get_attr_docs,
++    SparseConfig,
+ )
+ from vllm.config.cache import (
+     BlockSize,
+@@ -527,6 +528,7 @@
+ 
+     kv_transfer_config: KVTransferConfig | None = None
+     kv_events_config: KVEventsConfig | None = None
++    sparse_config: SparseConfig | None = None
+ 
+     ec_transfer_config: ECTransferConfig | None = None
+ 
+@@ -1121,6 +1123,7 @@
+             "--kv-transfer-config", **vllm_kwargs["kv_transfer_config"]
+         )
+         vllm_group.add_argument("--kv-events-config", **vllm_kwargs["kv_events_config"])
++        vllm_group.add_argument("--sparse-config", **vllm_kwargs["sparse_config"])
+         vllm_group.add_argument(
+             "--ec-transfer-config", **vllm_kwargs["ec_transfer_config"]
+         )
+@@ -1743,6 +1746,7 @@
+             compilation_config=compilation_config,
+             kv_transfer_config=self.kv_transfer_config,
+             kv_events_config=self.kv_events_config,
++            sparse_config=self.sparse_config,
+             ec_transfer_config=self.ec_transfer_config,
+             additional_config=self.additional_config,
+             optimization_level=self.optimization_level,
+diff -Nur vllm.baseline/vllm/v1/core/kv_cache_manager.py vllm/vllm/v1/core/kv_cache_manager.py
+--- vllm.baseline/vllm/v1/core/kv_cache_manager.py	2025-12-03 17:01:45.000000000 +0800
++++ vllm/vllm/v1/core/kv_cache_manager.py	2026-02-05 10:23:38.393569867 +0800
+@@ -212,6 +212,7 @@
+         num_lookahead_tokens: int = 0,
+         delay_cache_blocks: bool = False,
+         num_encoder_tokens: int = 0,
++        num_slots_sparsed: int | None = None,
+     ) -> KVCacheBlocks | None:
+         """Add slots for a request with new tokens to append.
+ 
+@@ -251,6 +252,16 @@
+         if num_new_tokens == 0:
+             raise ValueError("num_new_tokens must be greater than 0")
+ 
++        if num_slots_sparsed is not None and num_slots_sparsed >= 0:
++            from vsparse.core import (
++                SparseRunnerRole,
++                get_sparse_agent,
++                has_sparse_agent,
++            )
++            if has_sparse_agent(SparseRunnerRole.SCHEDULER):
++                sparse_agent = get_sparse_agent(SparseRunnerRole.SCHEDULER)
++                return sparse_agent.allocate_slots(self, request, num_slots_sparsed)
++
+         if new_computed_blocks is not None:
+             new_computed_block_list = new_computed_blocks.blocks
+         else:
+diff -Nur vllm.baseline/vllm/v1/core/sched/output.py vllm/vllm/v1/core/sched/output.py
+--- vllm.baseline/vllm/v1/core/sched/output.py	2025-12-03 17:01:33.000000000 +0800
++++ vllm/vllm/v1/core/sched/output.py	2026-02-05 10:23:38.393569867 +0800
+@@ -207,6 +207,8 @@
+     # EC Cache Connector metadata
+     ec_connector_metadata: ECConnectorMetadata | None = None
+ 
++    req_sparsed_slots: dict[str, int] | None = None
++
+     @classmethod
+     def make_empty(cls) -> "SchedulerOutput":
+         return cls(
+diff -Nur vllm.baseline/vllm/v1/core/sched/scheduler.py vllm/vllm/v1/core/sched/scheduler.py
+--- vllm.baseline/vllm/v1/core/sched/scheduler.py	2026-02-05 10:21:20.637578078 +0800
++++ vllm/vllm/v1/core/sched/scheduler.py	2026-02-05 10:25:12.137564280 +0800
+@@ -50,6 +50,11 @@
+ from vllm.v1.spec_decode.metrics import SpecDecodingStats
+ from vllm.v1.structured_output import StructuredOutputManager
+ from vllm.v1.utils import record_function_or_nullcontext
++from vsparse.core import (
++    SparseRunnerRole,
++    ensure_sparse_algorithm_initialized,
++    get_sparse_agent,
++)
+ 
+ logger = init_logger(__name__)
+ 
+@@ -117,6 +122,15 @@
+             if self.log_stats:
+                 self.connector_prefix_cache_stats = PrefixCacheStats()
+ 
++        self.sparse_agent = None
++        if (
++                vllm_config.sparse_config is not None
++                and vllm_config.sparse_config.enable_sparse
++        ):
++            ensure_sparse_algorithm_initialized(vllm_config, SparseRunnerRole.SCHEDULER)
++            self.sparse_agent = get_sparse_agent(SparseRunnerRole.SCHEDULER)
++            logger.info("Sparse Agent initialized successfully: %s", self.sparse_agent)
++
+         self.kv_event_publisher = EventPublisherFactory.create(
+             self.kv_events_config,
+             self.parallel_config.data_parallel_rank,
+@@ -232,11 +246,19 @@
+ 
+         # For logging.
+         scheduled_timestamp = time.monotonic()
++        req_sparsed_slots: dict[str, int] = {}
+ 
+         # First, schedule the RUNNING requests.
+         req_index = 0
+         while req_index < len(self.running) and token_budget > 0:
+             request = self.running[req_index]
++            
++            num_slots_sparsed: int | None = None
++            if self.sparse_agent is not None:
++                estimated = self.sparse_agent.estimate_num_slots(request)
++                if estimated >= 0:
++                    num_slots_sparsed = estimated
++                    req_sparsed_slots[request.request_id] = estimated
+ 
+             if (
+                 request.num_output_placeholders > 0
+@@ -310,6 +332,7 @@
+                         request,
+                         num_new_tokens,
+                         num_lookahead_tokens=self.num_lookahead_tokens,
++                        num_slots_sparsed=num_slots_sparsed,
+                     )
+ 
+                     if new_blocks is not None:
+@@ -463,6 +486,12 @@
+ 
+                 num_external_computed_tokens = 0
+                 load_kv_async = False
++                num_slots_sparsed: int | None = None
++                if self.sparse_agent is not None:
++                    estimated = self.sparse_agent.estimate_num_slots(request)
++                    if estimated >= 0:
++                        num_slots_sparsed = estimated
++                        req_sparsed_slots[request.request_id] = estimated
+ 
+                 # Get already-cached tokens.
+                 if request.num_computed_tokens == 0:
+@@ -579,6 +608,7 @@
+                     num_lookahead_tokens=effective_lookahead_tokens,
+                     delay_cache_blocks=load_kv_async,
+                     num_encoder_tokens=num_encoder_tokens,
++                    num_slots_sparsed=num_slots_sparsed,
+                 )
+ 
+                 if new_blocks is None:
+@@ -725,6 +755,7 @@
+             # the previous and the current steps.
+             finished_req_ids=self.finished_req_ids,
+             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
++            req_sparsed_slots=req_sparsed_slots,
+         )
+ 
+         # NOTE(Kuntai): this function is designed for multiple purposes:
+@@ -1358,6 +1389,8 @@
+         delay_free_blocks, kv_xfer_params = self._connector_finished(request)
+         self.encoder_cache_manager.free(request)
+         request_id = request.request_id
++        if self.sparse_agent is not None:
++            self.sparse_agent.schedule_finished(request_id)
+         self.finished_req_ids.add(request_id)
+         if self.finished_req_ids_dict is not None:
+             self.finished_req_ids_dict[request.client_index].add(request_id)
+diff -Nur vllm.baseline/vllm/v1/worker/block_table.py vllm/vllm/v1/worker/block_table.py
+--- vllm.baseline/vllm/v1/worker/block_table.py	2025-12-03 17:01:33.000000000 +0800
++++ vllm/vllm/v1/worker/block_table.py	2026-02-05 10:23:38.394569867 +0800
+@@ -118,6 +118,12 @@
+         self.num_blocks_per_row[row_idx] = 0
+         self.append_row(block_ids, row_idx)
+ 
++    def reset_row(self, row_idx: int) -> None:
++        self.num_blocks_per_row[row_idx] = 0
++        self.block_table.gpu[row_idx].fill_(0)
++        self.block_table.cpu[row_idx].fill_(0)
++        self.block_table.np[row_idx].fill(0)
++
+     def move_row(self, src: int, tgt: int) -> None:
+         num_blocks = self.num_blocks_per_row[src]
+         block_table_np = self.block_table.np
+@@ -312,6 +318,10 @@
+         for i, block_table in enumerate(self.block_tables):
+             block_table.add_row(block_ids[i], row_idx)
+ 
++    def reset_row(self, row_idx: int) -> None:
++        for block_table in self.block_tables:
++            block_table.reset_row(row_idx)
++
+     def move_row(self, src: int, tgt: int) -> None:
+         for block_table in self.block_tables:
+             block_table.move_row(src, tgt)
+diff -Nur vllm.baseline/vllm/v1/worker/gpu_model_runner.py vllm/vllm/v1/worker/gpu_model_runner.py
+--- vllm.baseline/vllm/v1/worker/gpu_model_runner.py	2026-02-05 10:21:20.646578077 +0800
++++ vllm/vllm/v1/worker/gpu_model_runner.py	2026-02-05 10:23:38.394569867 +0800
+@@ -156,6 +156,7 @@
+     check_ubatch_thresholds,
+ )
+ from vllm.v1.worker.utils import is_residual_scattered_for_sp
++from vsparse.core import SparseRunnerRole, get_sparse_agent, has_sparse_agent
+ 
+ from .utils import (
+     AttentionGroup,
+@@ -777,6 +778,11 @@
+         The SamplingMetadata is updated and copied to the GPU if there is a
+         new/resumed/paused/finished request in the batch.
+         """
++        if has_sparse_agent(SparseRunnerRole.WORKER):
++            agent = get_sparse_agent(SparseRunnerRole.WORKER)
++            for req_id in scheduler_output.finished_req_ids:
++                agent.request_finished(req_id)
++
+         # Remove finished requests from the cached states.
+         for req_id in scheduler_output.finished_req_ids:
+             self.requests.pop(req_id, None)
+@@ -888,6 +894,10 @@
+             resumed_from_preemption = req_id in req_data.resumed_req_ids
+             num_output_tokens = req_data.num_output_tokens[i]
+             req_index = self.input_batch.req_id_to_index.get(req_id)
++            is_sparsed_request = (
++                    scheduler_output.req_sparsed_slots is not None
++                    and scheduler_output.req_sparsed_slots.get(req_id) is not None
++            )
+ 
+             # prev_num_draft_len is used in async scheduling mode with
+             # spec decode. it indicates if need to update num_computed_tokens
+@@ -944,17 +954,17 @@
+                     self.input_batch.num_tokens_no_spec[req_index] = end_idx
+ 
+             # Update the block IDs.
+-            if not resumed_from_preemption:
+-                if new_block_ids is not None:
+-                    # Append the new blocks to the existing block IDs.
+-                    for block_ids, new_ids in zip(req_state.block_ids, new_block_ids):
+-                        block_ids.extend(new_ids)
+-            else:
++            if resumed_from_preemption:
+                 assert req_index is None
+                 assert new_block_ids is not None
+-                # The request is resumed from preemption.
+-                # Replace the existing block IDs with the new ones.
+                 req_state.block_ids = new_block_ids
++            elif is_sparsed_request:
++                assert new_block_ids is not None
++                req_state.block_ids = new_block_ids
++            else:
++                if new_block_ids is not None:
++                    for block_ids, new_ids in zip(req_state.block_ids, new_block_ids):
++                        block_ids.extend(new_ids)            
+ 
+             if req_index is None:
+                 # The request is not in the persistent batch.
+@@ -973,6 +983,8 @@
+             # Update the persistent batch.
+             self.input_batch.num_computed_tokens_cpu[req_index] = num_computed_tokens
+             if new_block_ids is not None:
++                if is_sparsed_request:
++                    self.input_batch.block_table.reset_row(req_index)
+                 self.input_batch.block_table.append_row(new_block_ids, req_index)
+ 
+             # For the last rank, we don't need to update the token_ids_cpu
+@@ -1348,6 +1360,28 @@
+             out=positions_np,
+         )
+ 
++        sparsed_positions_np = positions_np
++        if scheduler_output.req_sparsed_slots:
++            sparsed_positions_np = positions_np.copy()
++            for req_index in range(num_reqs):
++                req_id = self.input_batch.req_ids[req_index]
++                sparsed_slots = scheduler_output.req_sparsed_slots.get(req_id)
++                if sparsed_slots is None:
++                    continue
++                num_sched = int(num_scheduled_tokens[req_index])
++                if num_sched <= 0:
++                    continue
++                start = 0 if req_index == 0 else int(cu_num_tokens[req_index - 1])
++                end = int(cu_num_tokens[req_index])
++                if end - start != num_sched:
++                    continue
++                base = int(sparsed_slots) - num_sched
++                if base < 0:
++                    base = 0
++                sparsed_positions_np[start:end] = np.arange(
++                    base, base + num_sched, dtype=sparsed_positions_np.dtype
++                )
++
+         # Calculate M-RoPE positions.
+         # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
+         if self.uses_mrope:
+@@ -1422,8 +1456,8 @@
+                     ].copy_(req_embeds[start_pos:actual_end])
+ 
+                 output_idx += num_sched
+-
+-        self.input_batch.block_table.compute_slot_mapping(req_indices, positions_np)
++        
++        self.input_batch.block_table.compute_slot_mapping(req_indices, sparsed_positions_np)
+         self.input_batch.block_table.commit_slot_mapping(total_num_scheduled_tokens)
+ 
+         # Prepare the attention metadata.
+@@ -1435,9 +1469,16 @@
+         self.query_start_loc.copy_to_gpu()
+         query_start_loc = self.query_start_loc.gpu[: num_reqs + 1]
+ 
+-        self.seq_lens.np[:num_reqs] = (
+-            self.input_batch.num_computed_tokens_cpu[:num_reqs] + num_scheduled_tokens
+-        )
++        true_seq_lens_np = (
++                self.input_batch.num_computed_tokens_cpu[:num_reqs] + num_scheduled_tokens
++        ).copy()
++        self.seq_lens.np[:num_reqs] = true_seq_lens_np
++        if scheduler_output.req_sparsed_slots:
++            for req_index in range(num_reqs):
++                req_id = self.input_batch.req_ids[req_index]
++                sparsed_slots = scheduler_output.req_sparsed_slots.get(req_id)
++                if sparsed_slots is not None:
++                    self.seq_lens.np[req_index] = int(sparsed_slots)
+         # Fill unused with 0 for full cuda graph mode.
+         self.seq_lens.np[num_reqs:].fill(0)
+         self.seq_lens.copy_to_gpu()
+@@ -1446,11 +1487,13 @@
+         num_tokens_np = np.array(num_tokens, dtype=np.int32)
+ 
+         # Record which requests should not be sampled,
+-        # so that we could clear the sampled tokens before returning
+-        self.discard_request_mask.np[:num_reqs] = (
+-            self.seq_lens.np[:num_reqs] < num_tokens_np
+-        )
+-        self.discard_request_mask.copy_to_gpu(num_reqs)
++        # so that we could clear the sampled tokens before returning.
++        # IMPORTANT: for sparse requests, seq_lens may be overridden to the sparse
++        # working-set size (req_sparsed_slots). That value must NOT affect whether
++        # we sample tokens; token sampling should depend on the true sequence length
++        # (computed + scheduled tokens).
++        self.discard_request_mask.np[:num_reqs] = true_seq_lens_np < num_tokens_np
++        self.discard_request_mask.copy_to_gpu(num_reqs)         
+ 
+         # Copy the tensors to the GPU.
+         self._prepare_input_ids(
+@@ -2788,6 +2831,32 @@
+             inputs_embeds=inputs_embeds,
+             **model_kwargs,
+         )
++    
++    def _maybe_execute_sparse_begin(
++            self,
++            scheduler_output: "SchedulerOutput",
++            attn_metadata: PerLayerAttnMetadata,
++    ) -> None:
++        if not has_sparse_agent(SparseRunnerRole.WORKER):
++            return
++
++        agent = get_sparse_agent(SparseRunnerRole.WORKER)
++        sparse_metadata = agent.build_sparse_meta(
++            scheduler_output, self.requests, self.input_batch, attn_metadata
++        )
++        agent.bind_sparse_metadata(sparse_metadata)
++        agent.execute_model_begin(scheduler_output)
++
++    def _maybe_execute_sparse_finished(
++            self, logits_indices: torch.Tensor
++    ) -> torch.Tensor:
++        if not has_sparse_agent(SparseRunnerRole.WORKER):
++            return logits_indices
++
++        agent = get_sparse_agent(SparseRunnerRole.WORKER)
++        logits_indices = agent.execute_model_finished(logits_indices)
++        agent.clear_sparse_metadata()
++        return logits_indices
+ 
+     def _determine_batch_execution_and_padding(
+         self,
+@@ -3040,6 +3109,7 @@
+             record_function_or_nullcontext("gpu_model_runner: forward"),
+             self.maybe_get_kv_connector_output(scheduler_output) as kv_connector_output,
+         ):
++            self._maybe_execute_sparse_begin(scheduler_output, attn_metadata)
+             model_output = self._model_forward(
+                 input_ids=input_ids,
+                 positions=positions,
+@@ -3047,6 +3117,7 @@
+                 inputs_embeds=inputs_embeds,
+                 **model_kwargs,
+             )
++            logits_indices = self._maybe_execute_sparse_finished(logits_indices)
+ 
+         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
+             if self.use_aux_hidden_state_outputs:
+diff -Nur vllm.baseline/vllm/v1/worker/gpu_worker.py vllm/vllm/v1/worker/gpu_worker.py
+--- vllm.baseline/vllm/v1/worker/gpu_worker.py	2025-12-03 17:01:33.000000000 +0800
++++ vllm/vllm/v1/worker/gpu_worker.py	2026-02-05 10:23:38.394569867 +0800
+@@ -54,6 +54,7 @@
+ from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+ from vllm.v1.worker.utils import is_residual_scattered_for_sp
+ from vllm.v1.worker.worker_base import WorkerBase
++from vsparse.core import ensure_sparse_algorithm_initialized, SparseRunnerRole
+ 
+ logger = init_logger(__name__)
+ 
+@@ -392,6 +393,8 @@
+         # because `initialize_kv_cache` will inject kv cache groups not
+         # related to kv cache connector (e.g. kv cache sharing layers).
+         ensure_kv_transfer_initialized(self.vllm_config, kv_cache_config)
++        if self.vllm_config.sparse_config is not None and self.vllm_config.sparse_config.enable_sparse:
++            ensure_sparse_algorithm_initialized(self.vllm_config, SparseRunnerRole.WORKER)
+ 
+         if self.vllm_config.model_config.enable_sleep_mode:
+             from vllm.device_allocator.cumem import CuMemAllocator

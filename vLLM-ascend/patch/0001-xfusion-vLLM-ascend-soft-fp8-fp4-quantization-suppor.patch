@@ -1,0 +1,806 @@
+From 1cceb32f5274a4c8ee00783424d4448f30e2865b Mon Sep 17 00:00:00 2001
+From: chenxu <chenxu2@xfusion.com>
+Date: Mon, 22 Dec 2025 14:06:59 +0800
+Subject: [PATCH 1/4] [xfusion]vLLM-ascend: soft fp8/fp4 quantization support
+
+Offering:AI Solution 25
+CVE:
+Reference:
+Type:requirement
+DTS/US:
+reason: soft fp8/fp4 quantization support
+
+Signed-off-by: chenxu <chenxu2@xfusion.com>
+---
+ vllm_ascend/ops/fp4_ops.py                   | 117 ++++++++
+ vllm_ascend/ops/fp8_ops.py                   |  82 ++++++
+ vllm_ascend/ops/fused_moe/moe_comm_method.py |   7 +-
+ vllm_ascend/ops/fused_moe/moe_mlp.py         |  25 +-
+ vllm_ascend/quantization/quant_config.py     |  19 +-
+ vllm_ascend/quantization/utils.py            |  12 +
+ vllm_ascend/quantization/w4a16nvfp4.py       |  86 ++++++
+ vllm_ascend/quantization/w8a16fp8.py         | 282 +++++++++++++++++++
+ 8 files changed, 622 insertions(+), 8 deletions(-)
+ create mode 100644 vllm_ascend/ops/fp4_ops.py
+ create mode 100644 vllm_ascend/ops/fp8_ops.py
+ create mode 100644 vllm_ascend/quantization/w4a16nvfp4.py
+ create mode 100644 vllm_ascend/quantization/w8a16fp8.py
+
+diff --git a/vllm_ascend/ops/fp4_ops.py b/vllm_ascend/ops/fp4_ops.py
+new file mode 100644
+index 0000000..c55d3d9
+--- /dev/null
++++ b/vllm_ascend/ops/fp4_ops.py
+@@ -0,0 +1,117 @@
++# Copyright (c) 2025 Henan KunLun Technologies Co., Ltd. All rights reserved.
++
++import torch
++import torch_npu
++
++
++def _fp4_to_fp16(fp4_data: torch.Tensor):
++    device = fp4_data.device
++    qstate = torch.Tensor([
++        0.0, 0.5, 1, 1.5, 2, 3, 4, 6,
++        -0.0, -0.5, -1, -1.5, -2, -3, -4, -6
++    ]).to(torch.float16).to(device)
++    m, n = fp4_data.shape
++    d = fp4_data.view(-1)
++    unpacked = torch.empty(d.size(0) * 2, dtype=torch.uint8, device=device)
++    unpacked[1::2] = d >> 4
++    unpacked[0::2] = d & 0x0F
++    return qstate.gather(0, unpacked.to(torch.int64)).view(m, n * 2)
++
++
++def _fp8_to_fp16(uint8):
++    device = uint8.device
++    half = uint8.view(torch.int8).to(torch.float16)
++    int16 = half.to(torch.int16)
++    a = int16 << 7
++    b = torch.tensor(0XBF80, dtype=torch.uint16).to(device).view(torch.int16)
++    c = a & b
++    d = torch.tensor(0x5c00, dtype=torch.int16).to(device).view(torch.int16)
++    return c.view(torch.float16) * d.view(torch.float16)
++
++
++def _apply_local_scale(weight, scale):
++    assert weight.is_contiguous() and scale.is_contiguous()
++    return torch_npu.npu_fp4_apply_local_scale(weight, scale)
++
++
++def _soft_fp4_matmul(x, w, s, s2):
++    bf16_weight = _apply_local_scale(w, s)
++    mmres = (x @ bf16_weight.T)
++    res = mmres * s2
++    return res.to(torch.bfloat16)
++
++
++def _merged_soft_fp4_matmul(x, w, s, s2):
++    bf16_weight = _apply_local_scale(w, s)
++    mmres = (x @ bf16_weight.T)
++    d = mmres.size(1) // 2
++    mmres[:, :d] *= s2[0]
++    mmres[:, d:] *= s2[1]
++    return mmres.to(torch.bfloat16)
++
++
++def _qkv_merged_soft_fp4_matmul(x, w, s, s2):
++    bf16_weight = _apply_local_scale(w, s)
++    mmres = (x @ bf16_weight.T)
++    # only support Qwen3-32B-FP4 model now
++    d = mmres.size(1) // 10
++    mmres[:, :d * 8] *= s2[0]
++    mmres[:, d * 8:d * 9] *= s2[1]
++    mmres[:, d * 9:] *= s2[2]
++    return mmres.to(torch.bfloat16)
++
++
++def _reformat_fp4_weight_slice(weight: torch.Tensor) -> torch.Tensor:
++    assert weight.dtype == torch.uint8
++    device = weight.device
++    orig_shape = weight.shape
++    flat_weight = weight.view(-1)
++    logic_len = orig_shape.numel() * 2
++
++    low_bits = flat_weight & 0x0f
++    high_bits = (flat_weight >> 4) & 0x0f
++    unpacked = torch.empty(logic_len, dtype=torch.uint8, device=device)
++    unpacked[::2] = low_bits
++    unpacked[1::2] = high_bits
++
++    low_bits = unpacked[:logic_len//2]
++    high_bits = unpacked[logic_len // 2:]
++    result = low_bits | (high_bits << 4)
++    return result.view(orig_shape)
++
++
++BASIC_W_LEN = 512
++BASIC_SCALE_LEN = BASIC_W_LEN // 16
++NUM_BASIC_PER_LOOP = 32
++
++
++def reformat_fp4_weight(weight: torch.Tensor, uint8_len=NUM_BASIC_PER_LOOP * BASIC_W_LEN // 2) -> torch.Tensor:
++    assert weight.dtype == torch.uint8
++    assert weight.numel() % uint8_len == 0
++    shape = weight.shape
++    weight = weight.flatten()
++    result = torch.empty_like(weight)
++    for i in range(weight.numel() // uint8_len):
++        s = slice(i*uint8_len, (i+1)*uint8_len)
++        result[s] = _reformat_fp4_weight_slice(weight[s])
++    return result.view(shape)
++
++
++def fp4_matmul(x: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor, weight_scale_2: torch.Tensor) \
++    -> torch.Tensor:
++    '''
++    x: bf16, [batch_size, input_size]
++    weight: uint8, [output_size, input_size / 2]
++    weight_scale: uint8, [output_size, input_size / group_size], group_size=16
++    weight_scale_2: float32, [1] or [2] or [3]
++    return: bf16, [batch_size, output_size]
++    '''
++    assert weight_scale_2.size(0) in (1, 2, 3)
++    if weight_scale_2.size(0) == 1:
++        return _soft_fp4_matmul(x, weight, weight_scale, weight_scale_2)
++    elif weight_scale_2.size(0) == 2:
++        return _merged_soft_fp4_matmul(x, weight, weight_scale, weight_scale_2)
++    elif weight_scale_2.size(0) == 3:
++        return _qkv_merged_soft_fp4_matmul(x, weight, weight_scale, weight_scale_2)
++    else:
++        raise ValueError("Unsupported weight_scale_2 size for fp4_matmul.")
+diff --git a/vllm_ascend/ops/fp8_ops.py b/vllm_ascend/ops/fp8_ops.py
+new file mode 100644
+index 0000000..b11cbac
+--- /dev/null
++++ b/vllm_ascend/ops/fp8_ops.py
+@@ -0,0 +1,82 @@
++# Copyright (c) 2025 Henan KunLun Technologies Co., Ltd. All rights reserved.
++import torch
++import torch_npu
++
++
++def _dequant_fp8_weight(w: torch.Tensor, s: torch.Tensor, g: torch.Tensor, group_list_type=0):
++    assert w.is_contiguous() and s.is_contiguous() and g.is_contiguous()
++    return torch_npu.npu_dequant_fp8_weight(w, s, g, group_list_type)
++
++
++def fp8_matmul(x: torch.Tensor, w: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
++    '''
++    x: [M, K], bf16
++    w: [N, K], uint8 (actually fp8)
++    s: [ceil(N / 128), ceil(K / 128)], fp32
++    return: [M, N], bf16
++    '''
++    ACL_FORMAT_ND = 2
++    assert torch_npu.get_npu_format(
++        w) == ACL_FORMAT_ND and torch_npu.get_npu_format(s) == ACL_FORMAT_ND
++    if x.dim() == 2 and x.size(0) <= 128 and w.size(0) % 256 == 0 and w.size(1) % 256 == 0:
++        return torch_npu.npu_soft_fp8_gemm(x, w.T, s.T)
++    else:
++        if w.is_contiguous() and s.is_contiguous():
++            # param 'g' is not used in this case
++            dequanted = _dequant_fp8_weight(w, s, torch.empty(
++                1, dtype=torch.int64, device=x.device))
++            return (x @ dequanted.T)
++        else:
++            w = w.T
++            s = s.T
++            # param 'g' is not used in this case
++            dequanted = _dequant_fp8_weight(w, s, torch.empty(
++                1, dtype=torch.int64, device=x.device))
++            return (x @ dequanted)
++
++
++def fp8_grouped_matmul(x: torch.Tensor, w: torch.Tensor, s: torch.Tensor, g: torch.Tensor, group_list_type) \
++    -> torch.Tensor:
++    '''
++    x: [M, K], bf16
++    w: [G, N, K], uint8 (actually fp8)
++    s: [G, N // 128, K // 128], fp32    note: the last two dims of s must be multiples of 128
++    g: [G], int64
++    return: [M, N], bf16
++    '''
++    if w.is_contiguous() and s.is_contiguous():
++        dequanted = _dequant_fp8_weight(
++            w, s, g, group_list_type=group_list_type)
++        out = torch_npu.npu_grouped_matmul(
++            [x], [dequanted.mT], group_list=g, group_list_type=group_list_type, group_type=0, split_item=2)
++        return out[0]
++    else:
++        dequanted = _dequant_fp8_weight(
++            w.mT, s.mT, g, group_list_type=group_list_type)
++        out = torch_npu.npu_grouped_matmul(
++            [x], [dequanted], group_list=g, group_list_type=group_list_type, group_type=0, split_item=2)
++        return out[0]
++
++
++def optimize_weight_layout_for_fp8_matmul(w: torch.Tensor, s: torch.Tensor):
++    '''
++    w: [N, K], uint8 (actually fp8)
++    s: [ceil(N / 128), ceil(K / 128)], fp32
++    '''
++    assert w.is_contiguous() and s.is_contiguous()
++    if w.size(0) >= 8192 and w.size(1) == 5120:
++        w = w.T.contiguous().T
++        s = s.T.contiguous().T
++    return w, s
++
++
++def optimize_weight_layout_for_fp8_grouped_matmul(w: torch.Tensor, s: torch.Tensor):
++    '''
++    w: [G, N, K], uint8 (actually fp8)
++    s: [G, N // 128, K // 128], fp32    note: the last two dims of s must be multiples of 128
++    '''
++    assert w.is_contiguous() and s.is_contiguous()
++    if w.size(1) == 2048:
++        w = w.mT.contiguous().mT
++        s = s.mT.contiguous().mT
++    return w, s
+diff --git a/vllm_ascend/ops/fused_moe/moe_comm_method.py b/vllm_ascend/ops/fused_moe/moe_comm_method.py
+index d0afa7b..39a0542 100644
+--- a/vllm_ascend/ops/fused_moe/moe_comm_method.py
++++ b/vllm_ascend/ops/fused_moe/moe_comm_method.py
+@@ -93,6 +93,7 @@ class MoECommMethod(ABC):
+             apply_router_weight_on_input: bool = False,
+             use_int8_w8a8: bool = False,
+             use_int4_w4a8: bool = False,
++            use_fp8_w8a16: bool = False,
+             use_int4_w4a16: bool = False,
+             global_num_experts: Optional[int] = None,
+             expert_map: Optional[torch.Tensor] = None,
+@@ -133,7 +134,7 @@ class MoECommMethod(ABC):
+             dynamic_scale_for_share=dynamic_scale_for_share,
+             mc2_mask=mc2_mask,
+             apply_router_weight_on_input=apply_router_weight_on_input,
+-            with_quant=use_int8_w8a8 or use_int4_w4a8,
++            with_quant=use_int8_w8a8 or use_int4_w4a8, # or use_fp8_w8a16, soft fp8 doesn't do dynamic quant
+             dynamic_eplb=dynamic_eplb,
+             pertoken_scale=pertoken_scale)
+ 
+@@ -154,7 +155,8 @@ class MoECommMethod(ABC):
+                                        w2_offset=w2_offset,
+                                        topk_scales=topk_scales,
+                                        with_quant=use_int8_w8a8
+-                                       or use_int4_w4a8 or use_int4_w4a16,
++                                       or use_int4_w4a8 or use_int4_w4a16 or use_fp8_w8a16,
++                                       use_fp8_w8a16=use_fp8_w8a16,     # special flag for soft fp8
+                                        fusion=use_int8_w8a8,
+                                        need_trans=need_trans,
+                                        dynamic_eplb=dynamic_eplb)
+@@ -280,6 +282,7 @@ class FusedAlltoAllCommImpl(MoECommMethod):
+             apply_router_weight_on_input: bool = False,
+             use_int8_w8a8: bool = False,
+             use_int4_w4a8: bool = False,
++            use_fp8_w8a16: bool = False,
+             use_int4_w4a16: bool = False,
+             global_num_experts: Optional[int] = None,
+             expert_map: Optional[torch.Tensor] = None,
+diff --git a/vllm_ascend/ops/fused_moe/moe_mlp.py b/vllm_ascend/ops/fused_moe/moe_mlp.py
+index c2ba803..bb36d2d 100644
+--- a/vllm_ascend/ops/fused_moe/moe_mlp.py
++++ b/vllm_ascend/ops/fused_moe/moe_mlp.py
+@@ -24,6 +24,7 @@ from vllm.forward_context import get_forward_context
+ from vllm_ascend.ascend_forward_context import MoECommType
+ from vllm_ascend.utils import (AscendDeviceType, dispose_tensor,
+                                enable_custom_op, get_ascend_device_type)
++from vllm_ascend.ops import fp8_ops
+ 
+ 
+ def _custom_gmm_swiglu_enabled(fusion, dynamic_eplb):
+@@ -79,7 +80,23 @@ def quant_apply_mlp(hidden_states: torch.Tensor,
+                     w1_offset: Optional[torch.Tensor] = None,
+                     w2_offset: Optional[torch.Tensor] = None,
+                     fusion: bool = False,
+-                    dynamic_eplb: bool = False) -> torch.Tensor:
++                    dynamic_eplb: bool = False,
++                    use_fp8_w8a16: bool = False) -> torch.Tensor:
++    if use_fp8_w8a16:
++        hidden_states = fp8_ops.fp8_grouped_matmul(
++            hidden_states,
++            w1,
++            w1_scale,
++            group_list,
++            group_list_type)
++        hidden_states = torch_npu.npu_swiglu(hidden_states)
++        hidden_states = fp8_ops.fp8_grouped_matmul(
++            hidden_states,
++            w2,
++            w2_scale,
++            group_list,
++            group_list_type)
++        return hidden_states
+     if w1_offset is not None:
+         unquantized_hidden_states = hidden_states
+         quantized_hidden_states = None
+@@ -317,7 +334,8 @@ def unified_apply_mlp(hidden_states: torch.Tensor,
+                       with_quant: bool = False,
+                       fusion: bool = False,
+                       need_trans: bool = True,
+-                      dynamic_eplb: bool = False) -> torch.Tensor:
++                      dynamic_eplb: bool = False,
++                      use_fp8_w8a16: bool = False) -> torch.Tensor:
+     if with_quant:
+         assert w1_scale is not None and w2_scale is not None
+         return quant_apply_mlp(hidden_states=hidden_states,
+@@ -333,7 +351,8 @@ def unified_apply_mlp(hidden_states: torch.Tensor,
+                                w1_offset=w1_offset,
+                                w2_offset=w2_offset,
+                                fusion=fusion,
+-                               dynamic_eplb=dynamic_eplb)
++                               dynamic_eplb=dynamic_eplb,
++                               use_fp8_w8a16=use_fp8_w8a16)
+     else:
+         return unquant_apply_mlp(hidden_states=hidden_states,
+                                  w1=w1,
+diff --git a/vllm_ascend/quantization/quant_config.py b/vllm_ascend/quantization/quant_config.py
+index 6669fd2..16b2692 100644
+--- a/vllm_ascend/quantization/quant_config.py
++++ b/vllm_ascend/quantization/quant_config.py
+@@ -124,7 +124,7 @@ class AscendQuantConfig(QuantizationConfig):
+             self.quant_description['fa_quant_type'] is not None:
+             return AscendKVCacheMethod(self, prefix)
+         elif isinstance(layer, Attention) and self.quant_description.get(
+-                'kv_quant_type') == 'C8':
++            'kv_quant_type') in ('C8', 'W8A16FP8'):
+             return AscendKVCacheMethod(self, prefix)
+         elif isinstance(layer, FusedMoE):
+             if self.is_layer_skipped_ascend(prefix,
+@@ -155,7 +155,7 @@ class AscendQuantConfig(QuantizationConfig):
+             is_skipped = None
+             for shard_prefix in shard_prefixes:
+                 is_shard_skipped = self.quant_description[shard_prefix +
+-                                                          '.weight'] == "FLOAT"
++                                                          '.weight'] in ["FLOAT", "BFLOAT16", "FLOAT16"]
+ 
+                 if is_skipped is None:
+                     is_skipped = is_shard_skipped
+@@ -165,7 +165,7 @@ class AscendQuantConfig(QuantizationConfig):
+                         "are quantized. All shards of fused layers "
+                         "to have the same precision.")
+         else:
+-            is_skipped = self.quant_description[prefix + '.weight'] == "FLOAT"
++            is_skipped = self.quant_description[prefix + '.weight'] in ["FLOAT", "BFLOAT16", "FLOAT16"]
+ 
+         assert is_skipped is not None
+         return is_skipped
+@@ -286,6 +286,12 @@ class AscendLinearMethod(LinearMethodBase):
+         params_dtype: torch.dtype,
+         **extra_weight_attrs,
+     ) -> None:
++        if hasattr(self.quant_method, 'create_weights'):
++            self.quant_method.create_weights(
++                layer, input_size_per_partition, output_partition_sizes,
++                input_size, output_size, params_dtype, **extra_weight_attrs)
++            return
++        
+         output_size_per_partition = sum(output_partition_sizes)
+         weight_loader = extra_weight_attrs.get("weight_loader")
+ 
+@@ -431,6 +437,13 @@ class AscendFusedMoEMethod(FusedMoEMethodBase):
+         params_dtype: torch.dtype,
+         **extra_weight_attrs,
+     ) -> None:
++        if hasattr(self.quant_method, 'create_weights'):
++            self.quant_method.create_weights(
++                layer, num_experts, hidden_size,
++                intermediate_size_per_partition, params_dtype,
++                **extra_weight_attrs)
++            return
++
+         weight_param = self.quant_method.get_weight(
+             num_experts, intermediate_size_per_partition, hidden_size,
+             params_dtype)
+diff --git a/vllm_ascend/quantization/utils.py b/vllm_ascend/quantization/utils.py
+index 1162de4..f1d03d2 100644
+--- a/vllm_ascend/quantization/utils.py
++++ b/vllm_ascend/quantization/utils.py
+@@ -13,6 +13,10 @@ from .w8a8 import (AscendC8KVCacheMethod, AscendW8A8FusedMoEMethod,
+                    AscendW8A8LinearMethod)
+ from .w8a8_dynamic import (AscendW8A8DynamicFusedMoEMethod,
+                            AscendW8A8DynamicLinearMethod)
++from .w8a16fp8 import (AscendW8A16FP8FusedMoEMethod, 
++                       AscendW8A16FP8LinearMethod,
++                       AscendW8A16FP8KVCacheMethod)
++from .w4a16nvfp4 import AscendW4A16NVFP4LinearMethod
+ from .w8a8_pdmix import (AscendW8A8PDMixFusedMoeMethod,
+                          AscendW8A8PDMixLinearMethod)
+ 
+@@ -43,6 +47,14 @@ ASCEND_QUANTIZATION_METHOD_MAP: Dict[str, Dict[str, Type[Any]]] = {
+     "C8": {
+         "attention": AscendC8KVCacheMethod,
+     },
++    "W8A16FP8": {
++        "linear": AscendW8A16FP8LinearMethod,
++        "moe": AscendW8A16FP8FusedMoEMethod,
++        "attention": AscendW8A16FP8KVCacheMethod,
++    },
++    "W4A16NVFP4": {
++        "linear": AscendW4A16NVFP4LinearMethod,
++    },
+ }
+ 
+ 
+diff --git a/vllm_ascend/quantization/w4a16nvfp4.py b/vllm_ascend/quantization/w4a16nvfp4.py
+new file mode 100644
+index 0000000..d3aa44b
+--- /dev/null
++++ b/vllm_ascend/quantization/w4a16nvfp4.py
+@@ -0,0 +1,86 @@
++# Copyright (c) 2025 Henan KunLun Technologies Co., Ltd. All rights reserved.
++
++from typing import List, Optional, Tuple, Union
++
++import torch
++
++from vllm.model_executor.parameter import GroupQuantScaleParameter, ModelWeightParameter, PerTensorScaleParameter
++from vllm_ascend.ops import fp4_ops
++
++
++class AscendW4A16NVFP4LinearMethod:
++
++    def __init__(self) -> None:
++        self.group_size = 16
++
++    def create_weights(
++        self,
++        layer: torch.nn.Module,
++        input_size_per_partition: int,
++        output_partition_sizes: List[int],
++        input_size: int,
++        output_size: int,
++        params_dtype: torch.dtype,
++        **extra_weight_attrs,
++    ) -> None:
++        output_size_per_partition = sum(output_partition_sizes)
++        layer.logical_widths = output_partition_sizes
++        layer.input_size_per_partition = input_size_per_partition
++        layer.output_size_per_partition = output_size_per_partition
++        weight_loader = getattr(layer, 'weight_loader_v2',
++                                extra_weight_attrs.get('weight_loader'))
++
++        weight = ModelWeightParameter(
++            data=torch.empty(
++                sum(output_partition_sizes),
++                input_size_per_partition // 2,
++                dtype=torch.uint8),
++            input_dim=1,
++            output_dim=0,
++            weight_loader=weight_loader)
++        layer.register_parameter("weight", weight)
++
++        weight_global_scale = PerTensorScaleParameter(
++            data=torch.empty(len(output_partition_sizes), dtype=torch.float32),
++            weight_loader=weight_loader)
++        layer.register_parameter("weight_scale_2", weight_global_scale)
++
++        weight_scale = GroupQuantScaleParameter(
++            data=torch.empty(
++                sum(output_partition_sizes),
++                input_size_per_partition // self.group_size,
++                dtype=torch.float8_e4m3fn,),
++            input_dim=1,
++            output_dim=0,
++            weight_loader=weight_loader)
++        layer.register_parameter("weight_scale", weight_scale)
++
++        input_global_scale = PerTensorScaleParameter(
++            data=torch.empty(len(output_partition_sizes), dtype=torch.float32),
++            weight_loader=weight_loader)
++        layer.register_parameter("input_scale", input_global_scale)
++
++        layer.update_param_tp_status()
++
++    @staticmethod
++    def apply(
++        layer: torch.nn.Module,
++        x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
++        bias: Optional[torch.Tensor] = None,
++        tp_rank: Optional[int] = 0,
++    ) -> torch.Tensor:
++        return fp4_ops.fp4_matmul(x, layer.weight.data, layer.weight_scale.data, layer.weight_scale_2.data)
++
++    @staticmethod
++    def process_weights_after_loading(layer):
++        weight_data = fp4_ops.reformat_fp4_weight(layer.weight.data)
++        weight_scale_data = layer.weight_scale.data.view(torch.uint8)
++        weight_scale_2_data = layer.weight_scale_2.data.to(torch.bfloat16)
++        del layer.input_scale
++
++        # for torch compile
++        layer.weight = torch.nn.Parameter(weight_data, requires_grad=False)
++        layer.weight_scale = torch.nn.Parameter(
++            weight_scale_data, requires_grad=False)
++        layer.weight_scale_2 = torch.nn.Parameter(
++            weight_scale_2_data, requires_grad=False)
+diff --git a/vllm_ascend/quantization/w8a16fp8.py b/vllm_ascend/quantization/w8a16fp8.py
+new file mode 100644
+index 0000000..5c4e8fa
+--- /dev/null
++++ b/vllm_ascend/quantization/w8a16fp8.py
+@@ -0,0 +1,282 @@
++# Copyright (c) 2025 Henan KunLun Technologies Co., Ltd. All rights reserved.
++from typing import Any, Callable, Dict, Optional, Tuple, Union, List
++
++import torch
++import torch_npu
++from vllm.config import CompilationMode, get_current_vllm_config
++
++from vllm.distributed import get_ep_group
++from vllm.forward_context import get_forward_context
++from vllm.model_executor.utils import set_weight_attrs
++from vllm.model_executor.layers.fused_moe import (FusedMoeWeightScaleSupported)
++from vllm.model_executor.parameter import (BlockQuantScaleParameter)
++from vllm.model_executor.layers.quantization.utils.fp8_utils import (
++    create_fp8_scale_parameter,
++    create_fp8_weight_parameter,
++    validate_fp8_block_shape)
++from vllm_ascend.ascend_config import get_ascend_config
++from vllm_ascend.distributed.parallel_state import get_mc2_group
++from vllm_ascend.ops.fused_moe.experts_selector import select_experts
++from vllm_ascend.ops import fp8_ops
++
++
++def ceil(x, y):
++    return (x + y - 1) // y
++
++
++class AscendW8A16FP8LinearMethod:
++
++    def __init__(self):
++        self.weight_block_size = (128, 128)
++
++    def create_weights(
++        self,
++        layer: torch.nn.Module,
++        input_size_per_partition: int,
++        output_partition_sizes: List[int],
++        input_size: int,
++        output_size: int,
++        params_dtype: torch.dtype,
++        **extra_weight_attrs,
++    ) -> None:
++        # adapted from vllm.model_executor.layers.quantization.fp8.FP8LinearMethod.create_weights
++        output_size_per_partition = sum(output_partition_sizes)
++        # When using FP8 quantization, all Linear classes in vllm prefer using weight_loader_v2 if available.
++        weight_loader = getattr(layer, 'weight_loader_v2',
++                                None) or extra_weight_attrs.get('weight_loader')
++
++        layer.logical_widths = output_partition_sizes
++        layer.input_size_per_partition = input_size_per_partition
++        layer.output_size_per_partition = output_size_per_partition
++        layer.orig_dtype = params_dtype
++        layer.weight_block_size = self.weight_block_size
++
++        validate_fp8_block_shape(layer, input_size, output_size,
++                                 input_size_per_partition,
++                                 output_partition_sizes,
++                                 self.weight_block_size)
++
++        weight = create_fp8_weight_parameter(output_size_per_partition,
++                                             input_size_per_partition,
++                                             weight_loader)
++        layer.register_parameter("weight", weight)
++
++        scale = create_fp8_scale_parameter(BlockQuantScaleParameter,
++                                           output_partition_sizes,
++                                           input_size_per_partition,
++                                           self.weight_block_size,
++                                           weight_loader)
++        set_weight_attrs(scale, {"scale_type": "weight_scale"})
++        layer.register_parameter("weight_scale_inv", scale)
++        # set tp_rank & tp_size for weight and weight_scale_inv
++        layer.update_param_tp_status()
++
++    @staticmethod
++    def apply(
++        layer: torch.nn.Module,
++        x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
++        bias: Optional[torch.Tensor] = None,
++        tp_rank: Optional[int] = 0,
++    ) -> torch.Tensor:
++        return fp8_ops.fp8_matmul(x, layer.weight.data, layer.weight_scale_inv.data)
++
++    @staticmethod
++    def process_weights_after_loading(layer):
++        layer.weight.data = layer.weight.data.view(torch.uint8)
++        layer.weight_scale_inv.data = layer.weight_scale_inv.data.to(
++            torch.float32)
++        layer.weight.data, layer.weight_scale_inv.data = fp8_ops.optimize_weight_layout_for_fp8_matmul(
++            layer.weight.data, layer.weight_scale_inv.data)
++
++        # Replace with plain nn.Parameter to avoid torch.compile issues with custom Parameter classes
++        layer.weight = torch.nn.Parameter(
++            layer.weight.data, requires_grad=False)
++        layer.weight_scale_inv = torch.nn.Parameter(
++            layer.weight_scale_inv.data, requires_grad=False)
++
++
++class AscendW8A16FP8FusedMoEMethod:
++
++    def __init__(self):
++        self.transpose_weight = True
++
++        self.ep_group = get_ep_group()
++
++        vllm_config = get_current_vllm_config()
++        ascend_config = get_ascend_config()
++        self.use_aclgraph = (vllm_config.compilation_config.mode
++                             == CompilationMode.VLLM_COMPILE
++                             and not vllm_config.model_config.enforce_eager)
++
++        self.dynamic_eplb = ascend_config.dynamic_eplb or ascend_config.expert_map_record_path
++        self.in_dtype = vllm_config.model_config.dtype
++
++        try:
++            device_group = get_mc2_group().device_group
++            local_rank = torch.distributed.get_rank(group=device_group)
++            backend = device_group._get_backend(torch.device("npu"))
++            self.moe_all_to_all_group_name = backend.get_hccl_comm_name(
++                local_rank)
++        except AttributeError:
++            self.moe_all_to_all_group_name = ""
++
++    @staticmethod
++    def create_weight_param_dict(num_experts: int, intermediate_size_per_partition: int,
++                                 hidden_sizes: int) -> Dict[str, Any]:
++        param_dict = {}
++        param_dict["w13_weight"] = torch.empty(num_experts,
++                                               2 *
++                                               intermediate_size_per_partition,
++                                               hidden_sizes,
++                                               dtype=torch.float8_e4m3fn)
++        param_dict["w2_weight"] = torch.empty(num_experts,
++                                              hidden_sizes,
++                                              intermediate_size_per_partition,
++                                              dtype=torch.float8_e4m3fn)
++        return param_dict
++
++    @staticmethod
++    def create_dequant_scale_param_dict(num_experts: int,
++                                        intermediate_size_per_partition: int,
++                                        hidden_sizes: int) -> Dict[str, Any]:
++        param_dict = {}
++        param_dict["w13_weight_scale_inv"] = torch.empty(
++            num_experts,
++            2 * intermediate_size_per_partition // 128,
++            hidden_sizes // 128,
++            dtype=torch.float)
++        param_dict["w2_weight_scale_inv"] = torch.empty(num_experts,
++                                                        hidden_sizes // 128,
++                                                        intermediate_size_per_partition // 128,
++                                                        dtype=torch.float)
++        return param_dict
++
++    def create_weights(
++        self,
++        layer: torch.nn.Module,
++        num_experts: int,
++        hidden_size: int,
++        intermediate_size_per_partition: int,
++        params_dtype: torch.dtype,
++        **extra_weight_attrs,
++    ) -> None:
++        weight_param = self.create_weight_param_dict(
++            num_experts, intermediate_size_per_partition, hidden_size)
++        for param_key, param_value in weight_param.items():
++            param = torch.nn.Parameter(param_value, requires_grad=False)
++            layer.register_parameter(param_key, param)
++            set_weight_attrs(param, extra_weight_attrs)
++
++        extra_weight_attrs.update(
++            {"quant_method": FusedMoeWeightScaleSupported.BLOCK.value})
++        dequant_scale_param = self.create_dequant_scale_param_dict(
++            num_experts, intermediate_size_per_partition, hidden_size)
++        for param_key, param_value in dequant_scale_param.items():
++            param = torch.nn.Parameter(param_value, requires_grad=False)
++            layer.register_parameter(param_key, param)
++            set_weight_attrs(param, extra_weight_attrs)
++
++    def apply(
++        self,
++        layer: torch.nn.Module,
++        x: torch.Tensor,
++        router_logits: torch.Tensor,
++        top_k: int,
++        renormalize: bool,
++        use_grouped_topk: bool = False,
++        global_num_experts: int = -1,
++        expert_map: Optional[torch.Tensor] = None,
++        topk_group: Optional[int] = None,
++        num_expert_group: Optional[int] = None,
++        custom_routing_function: Optional[Callable] = None,
++        scoring_func: str = "softmax",
++        e_score_correction_bias: Optional[torch.Tensor] = None,
++        is_prefill: bool = True,
++        enable_force_load_balance: bool = True,
++        log2phy: torch.Tensor = None,
++        global_redundant_expert_num: int = 0,
++        shared_experts: Optional[Any] = None,
++        quantized_x_for_share: Optional[Any] = None,
++        dynamic_scale_for_share: Optional[Any] = None,
++        **kwargs,
++    ) -> torch.Tensor:
++        assert router_logits.shape[
++            1] == global_num_experts - global_redundant_expert_num, \
++                "Number of global experts mismatch (excluding redundancy)"
++
++        topk_weights, topk_ids = select_experts(
++            hidden_states=x,
++            router_logits=router_logits,
++            top_k=top_k,
++            use_grouped_topk=use_grouped_topk,
++            renormalize=renormalize,
++            topk_group=topk_group,
++            num_expert_group=num_expert_group,
++            custom_routing_function=custom_routing_function,
++            scoring_func=scoring_func,
++            e_score_correction_bias=e_score_correction_bias,
++            global_num_experts=global_num_experts)
++
++        # naive expert load balance for profiling
++        if enable_force_load_balance:
++            topk_ids = torch.randint_like(topk_ids, 0, global_num_experts)
++
++        if self.use_aclgraph:
++            moe_comm_method = get_forward_context().moe_comm_method
++            return moe_comm_method.fused_experts(
++                hidden_states=x,
++                w1=layer.w13_weight.data,
++                w2=layer.w2_weight.data,
++                topk_weights=topk_weights,
++                topk_ids=topk_ids,
++                use_fp8_w8a16=True,
++                w1_scale=layer.w13_weight_scale_inv.data,
++                w2_scale=layer.w2_weight_scale_inv.data,
++                expert_map=expert_map,
++                dynamic_eplb=self.dynamic_eplb,
++                log2phy=log2phy,
++                global_redundant_expert_num=global_redundant_expert_num)
++
++        topk_weights = topk_weights.to(x.dtype)
++
++        moe_comm_method = get_forward_context().moe_comm_method
++        return moe_comm_method.fused_experts(
++            hidden_states=x,
++            w1=layer.w13_weight.data,
++            w1_scale=layer.w13_weight_scale_inv.data,
++            w2=layer.w2_weight.data,
++            w2_scale=layer.w2_weight_scale_inv.data,
++            topk_weights=topk_weights,
++            topk_ids=topk_ids,
++            use_fp8_w8a16=True,
++            expert_map=expert_map,
++            log2phy=log2phy,
++            global_redundant_expert_num=global_redundant_expert_num,
++            shared_experts=shared_experts,
++            quantized_x_for_share=quantized_x_for_share,
++            dynamic_scale_for_share=dynamic_scale_for_share,
++            dynamic_eplb=self.dynamic_eplb)
++
++    @staticmethod
++    def process_weights_after_loading(layer):
++        layer.w2_weight.data = layer.w2_weight.data.view(torch.uint8)
++        layer.w13_weight.data = layer.w13_weight.data.view(torch.uint8)
++        layer.w2_weight_scale_inv.data = layer.w2_weight_scale_inv.data.to(
++            torch.float32)
++        layer.w13_weight_scale_inv.data = layer.w13_weight_scale_inv.data.to(
++            torch.float32)
++        layer.w2_weight.data, layer.w2_weight_scale_inv.data = fp8_ops.optimize_weight_layout_for_fp8_grouped_matmul(
++            layer.w2_weight.data, layer.w2_weight_scale_inv.data)
++        layer.w13_weight.data, layer.w13_weight_scale_inv.data = fp8_ops.optimize_weight_layout_for_fp8_grouped_matmul(
++            layer.w13_weight.data, layer.w13_weight_scale_inv.data)
++
++
++# Placeholder for FP8 KV cache quantization to avoid errors during weight loading.
++# Note that FP8 KV cache quantization is not implemented yet.
++class AscendW8A16FP8KVCacheMethod:
++    @staticmethod
++    def create_weights(layer: torch.nn.Module) -> None:
++        layer.k_scale = torch.nn.Parameter(
++            torch.tensor(-1.0), requires_grad=False)
++        layer.v_scale = torch.nn.Parameter(
++            torch.tensor(-1.0), requires_grad=False)
+-- 
+2.43.0
+
