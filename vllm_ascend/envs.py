@@ -117,6 +117,12 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_FUSION_OP_TRANSPOSE_KV_CACHE_BY_BLOCK": lambda: bool(
         int(os.getenv("VLLM_ASCEND_FUSION_OP_TRANSPOSE_KV_CACHE_BY_BLOCK", "1"))
     ),
+    # EARS (Entropy-Adaptive Rejection Sampling) tolerance for speculative decoding.
+    # When > 0, EARS dynamically adjusts rejection threshold based on prediction
+    # uncertainty. Higher values increase acceptance rate but may reduce output quality.
+    # Only effective when spec decode method is mtp, eagle3, or suffix.
+    # Valid range: 0.0 (disabled) to 1.0.
+    "VLLM_EARS_TOLERANCE": lambda: float(os.getenv("VLLM_EARS_TOLERANCE", "0.0")),
 }
 
 # end-env-vars-definition

@@ -85,6 +85,8 @@ from vllm.v1.worker.ubatch_utils import (
 )
 from vllm.v1.worker.utils import AttentionGroup
 
+# yapf: enable
+import vllm_ascend.envs as envs_ascend
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata, using_paged_attention
@@ -97,8 +99,6 @@ from vllm_ascend.compilation.acl_graph import (
     set_graph_params,
     update_full_graph_params,
 )
-
-# yapf: enable
 from vllm_ascend.eplb.adaptor.vllm_adaptor import VllmEplbAdaptor
 from vllm_ascend.eplb.core.eplb_device_transfer_loader import D2DExpertWeightLoader
 from vllm_ascend.eplb.core.eplb_worker import EplbProcess
@@ -106,6 +106,7 @@ from vllm_ascend.eplb.eplb_updator import EplbUpdator
 from vllm_ascend.eplb.utils import model_register
 from vllm_ascend.ops.rotary_embedding import set_cos_and_sin, update_cos_sin
 from vllm_ascend.patch.worker.patch_module import patch_torch_npu_argsort
+from vllm_ascend.sample.rejection_sampler import EntropyAdaptiveRejectionSampler
 from vllm_ascend.sample.sampler import AscendSampler
 from vllm_ascend.spec_decode import get_spec_decode_method
 from vllm_ascend.spec_decode.eagle_proposer import EagleProposer
@@ -403,7 +404,7 @@ class NPUModelRunner(GPUModelRunner):
                 if self.speculative_config.method == "eagle3":
                     assert isinstance(self.drafter, EagleProposer)
                     self.use_aux_hidden_state_outputs = self.drafter.eagle3_use_aux_hidden_state
-                self.rejection_sampler = RejectionSampler(self.sampler)
+                self.rejection_sampler = self._create_rejection_sampler()
             self.actual_seq_lengths_q = list(
                 range(self.decode_token_per_req, self.max_num_tokens + 1, self.decode_token_per_req)
             )
@@ -412,6 +413,21 @@ class NPUModelRunner(GPUModelRunner):
 
     def _get_drafter(self):
         return get_spec_decode_method(self.speculative_config.method, self.vllm_config, self.device, self)
+
+    def _create_rejection_sampler(self):
+        ears_tolerance = envs_ascend.VLLM_EARS_TOLERANCE
+        if ears_tolerance > 0 and self.speculative_config.method in (
+            "mtp", "eagle3", "suffix"
+        ):
+            logger.info(
+                "Using EARS rejection sampling with base_tolerance=%s",
+                ears_tolerance,
+            )
+            return EntropyAdaptiveRejectionSampler(
+                self.sampler,
+                base_tolerance=ears_tolerance,
+            )
+        return RejectionSampler(self.sampler)
 
     def _use_aclgraph(self) -> bool:
         return (
